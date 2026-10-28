@@ -1,0 +1,15 @@
+node_modules/
+.data/
+*.log
+__pycache__/
+*.pyc
+
+# Local secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+.codex/
+
+# Scratch runtimes, browser profiles, generated probes; retain project documentation
+/.scratch/*
+!/.scratch/termux-codex/

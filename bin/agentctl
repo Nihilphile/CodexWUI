@@ -1,0 +1,3 @@
+#!/data/data/com.termux/files/usr/bin/sh
+AGENTCTL_SCRIPT="$(readlink -f "$0")"
+exec node "$(dirname "$AGENTCTL_SCRIPT")/../scripts/agentctl.mjs" "$@"

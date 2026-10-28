@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#141917">
+  <title>文件预览 · Codex</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/file-preview.css">
+</head>
+<body class="file-preview">
+  <header class="preview-toolbar">
+    <div class="preview-heading"><h1 id="file-name">文件预览</h1><p id="file-path"></p></div>
+    <nav aria-label="文件操作">
+      <button id="toggle-source" type="button" hidden>查看原文</button>
+      <a id="original-file" target="_blank" rel="noopener noreferrer" hidden>打开原文件 ↗</a>
+      <a id="download-file" download hidden>下载</a>
+    </nav>
+  </header>
+  <main class="preview-main">
+    <p id="file-status" role="status">正在读取文件…</p>
+    <div id="file-content" class="prose"></div>
+  </main>
+  <script src="/vendor/markdown-it.min.js"></script>
+  <script src="/vendor/katex/katex.min.js"></script>
+  <script src="/markdown.js"></script>
+  <script src="/file-preview.js"></script>
+</body>
+</html>

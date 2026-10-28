@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#141917">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Codex · 本地工作台</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/visualizations.css">
+  <link rel="stylesheet" href="/config.css">
+  <script src="/vendor/markdown-it.min.js"></script>
+  <script src="/vendor/katex/katex.min.js"></script>
+  <script src="/markdown.js"></script>
+  <script src="/visualizations.js"></script>
+  <script src="/files.js"></script>
+  <script src="/queue.js"></script>
+  <script src="/btw.js"></script>
+  <script src="/reload.js"></script>
+  <script src="/config.js"></script>
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="sidebar" class="sidebar">
+    <div class="brand"><span class="brand-icon">⌘</span><strong>codex<span class="brand-sub"> / local</span></strong><button id="close-sidebar" class="icon-button mobile-only" aria-label="关闭会话列表">×</button></div>
+    <div class="section-label">工作空间 <button id="add-project" class="small-button" title="添加项目目录">＋ 添加</button></div>
+    <label class="sr-only" for="project-select">当前项目</label>
+    <select id="project-select" aria-label="当前项目"></select>
+    <div id="project-path" class="project-path"></div>
+    <button id="new-thread" class="new-thread"><span>＋</span> 新建会话 <kbd>NEW</kbd></button>
+    <div class="section-label history-label">会话历史 <button id="refresh-threads" class="small-button" title="刷新历史" aria-label="刷新历史">↻</button></div>
+    <label class="sr-only" for="thread-search">筛选当前已加载会话</label>
+    <input id="thread-search" class="thread-search" placeholder="筛选会话…" type="search">
+    <nav id="thread-list" class="thread-list" aria-label="历史会话"></nav>
+    <button id="more-threads" class="text-button" hidden>加载更多会话</button>
+    <footer class="sidebar-footer"><span id="connection-dot" class="status-dot"></span><span id="connection-label">正在连接</span><span id="memory-usage" class="memory-usage" title="Codex Web 及工具进程的合计内存（RSS）">RAM --/--G</span><span class="local-pill">LOCALHOST</span></footer>
+  </aside>
+  <main class="workspace">
+    <header class="workspace-header">
+      <button id="open-sidebar" class="icon-button mobile-only" aria-label="打开项目与会话">☰</button>
+      <div class="thread-heading"><div id="breadcrumb" class="breadcrumb">本地工作台</div><h1 id="thread-title">开始一段新的工作</h1></div>
+      <span id="thread-status" class="state-pill">就绪</span>
+      <button id="open-config" type="button" class="icon-button" aria-label="打开全局设置" title="全局设置 · /config">⚙</button>
+      <button id="toggle-inspector" class="icon-button" aria-label="打开右侧面板" title="文件、子代理与改动">◫</button>
+    </header>
+    <div class="view-bar"><div class="conversation-controls"><span class="conversation-label">会话 <span id="agent-summary"></span></span><button id="back-parent" class="back-parent" type="button" hidden>← 返回父会话</button></div><button id="model-label" class="model-label" type="button" title="选择模型和 reasoning · /model">使用本机配置 ▾</button></div>
+    <div id="parallel-note" class="parallel-note" hidden></div>
+    <div id="connection-banner" class="connection-banner" hidden></div>
+    <section id="chat-view" class="view chat-view">
+      <div id="message-scroll" class="message-scroll">
+        <button id="more-turns" class="text-button older-button" hidden>加载更早消息</button>
+        <div id="messages" class="messages"></div>
+      </div>
+      <div id="approval-list" class="approval-list"></div>
+      <div id="steer-list" class="steer-list" aria-label="待接收引导" aria-live="polite"></div>
+      <div id="queue-list" class="queue-list"></div>
+      <form id="composer" class="composer">
+        <div id="readonly-note" class="readonly-note" hidden>子代理会话仅供查看，由父会话协调任务。</div>
+        <label class="sr-only" for="prompt">发送给 Codex 的消息</label>
+        <textarea id="prompt" rows="2" placeholder="描述你想完成的工作…"></textarea>
+        <div id="suggestions" class="suggestions" hidden></div>
+        <div id="skill-chips" class="skill-chips"></div>
+        <div id="image-attachments" class="image-attachments" aria-label="附件" aria-live="polite" hidden></div>
+        <!-- Explicit document types avoid the media-only chooser shown by some Android browsers. -->
+        <input id="file-input" type="file" accept=".pdf,.txt,.md,.csv,.json,.jsonl,.xml,.yaml,.yml,.log,.html,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.sh,.c,.h,.cpp,.java,.go,.rs,.sql,.toml,.ini,.conf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.7z,.rar,.tar,.gz,.epub,application/pdf,text/plain,text/csv,application/json,application/zip,application/octet-stream,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation" multiple hidden>
+        <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+        <div class="composer-footer"><button id="command-menu" type="button" class="composer-tool" title="斜杠命令">/</button><button id="skill-menu" type="button" class="composer-tool" title="选择技能">$</button><button id="attach-image" type="button" class="composer-tool" aria-label="添加图片" title="添加图片 · PNG / JPEG / WebP · 单张最多 10 MiB">▧</button><button id="attach-file" type="button" class="composer-tool" aria-label="添加文件" title="添加文件 · 正在读取上传限制" disabled>📎</button><span id="composer-hint">沿用 Codex 权限配置</span><select id="send-mode" aria-label="运行中发送方式" hidden><option value="steer">引导 · Steer</option><option value="queue">排队 · Follow-up</option></select><button id="stop-turn" type="button" class="stop-button" hidden>■</button><button id="send" class="send-button" type="submit" aria-label="发送消息">发送 ↑</button></div>
+      </form>
+      <div class="bottom-note">切换会话不会停止任务 · 同项目会话共享工作目录</div>
+    </section>
+  </main>
+  <div id="inspector-scrim" class="scrim" hidden></div>
+  <aside id="inspector" class="inspector" hidden>
+    <header class="inspector-header"><strong>工作区面板</strong><button id="close-inspector" class="icon-button" aria-label="收起右侧面板">×</button></header>
+    <nav class="inspector-tabs tabs" role="tablist" aria-label="工作区面板标签"><button id="inspector-files-tab" role="tab" aria-controls="files-view" aria-selected="true" class="tab active" data-view="files">文件</button><button id="inspector-agents-tab" role="tab" aria-controls="agents-view" aria-selected="false" tabindex="-1" class="tab" data-view="agents">子代理 <span id="agent-count">0</span></button><button id="inspector-git-tab" role="tab" aria-controls="git-view" aria-selected="false" tabindex="-1" class="tab" data-view="git">Git diff</button><button id="inspector-btw-tab" role="tab" aria-controls="btw-view" aria-selected="false" tabindex="-1" class="tab" data-view="btw">BTW</button></nav>
+    <section id="btw-view" class="view btw-view" role="tabpanel" aria-labelledby="inspector-btw-tab" hidden></section>
+    <section id="files-view" class="view files-view" role="tabpanel" aria-labelledby="inspector-files-tab"></section>
+    <section id="agents-view" class="view secondary-view" role="tabpanel" aria-labelledby="inspector-agents-tab" tabindex="0" hidden><div class="panel-heading"><div><h2>子代理</h2><p>追踪这个会话派发的工作</p></div><button id="refresh-agents" class="secondary-button">刷新</button></div><div id="agents-list"></div><button id="more-agents" class="text-button" hidden>加载更多子代理</button></section>
+    <section id="git-view" class="view secondary-view" role="tabpanel" aria-labelledby="inspector-git-tab" tabindex="0" hidden><div class="panel-heading"><div><h2>工作区改动</h2><p>只读查看 · Git 操作交给 agent</p></div><button id="refresh-git" class="secondary-button">刷新</button></div><div id="git-body"></div></section>
+  </aside>
+  <dialog id="project-dialog">
+    <form id="project-form"><div class="dialog-heading"><h2>添加项目</h2><button id="close-project-dialog" type="button" class="icon-button" aria-label="关闭">×</button></div><p class="muted">输入 Termux 中已有的项目目录。</p><label for="project-input">目录路径</label><input id="project-input" name="path" placeholder="~/projects/my-app" required autocomplete="off"><div id="project-suggestions" class="project-suggestions"></div><p id="project-error" class="error-text" role="alert"></p><button class="primary-button" type="submit">打开项目 →</button></form>
+  </dialog>
+  <dialog id="model-dialog">
+    <form id="model-form">
+      <div class="dialog-heading"><h2>模型与 Reasoning</h2><button id="close-model-dialog" type="button" class="icon-button" aria-label="关闭模型设置">×</button></div>
+      <p id="model-scope" class="muted">设置作用于当前会话的后续消息。</p>
+      <label for="model-select">模型</label><select id="model-select" required></select>
+      <p id="model-description" class="muted"></p>
+      <label for="reasoning-select">Reasoning · 推理强度</label><select id="reasoning-select"></select>
+      <p id="reasoning-description" class="muted"></p>
+      <p id="model-error" class="error-text" role="alert"></p>
+      <button id="save-model" class="primary-button" type="submit">保存到当前会话</button>
+    </form>
+  </dialog>
+  <dialog id="steer-dialog">
+    <form id="steer-form">
+      <div class="dialog-heading"><h2>修改待发送引导</h2><button id="close-steer-dialog" type="button" class="icon-button" aria-label="取消修改">×</button></div>
+      <p class="muted">编辑期间暂停发送。关闭窗口会保留原内容并恢复原来的发送安排。</p>
+      <label for="steer-text">引导内容</label><textarea id="steer-text" rows="6"></textarea>
+      <div id="steer-edit-attachments" class="steer-edit-attachments"></div>
+      <p id="steer-error" class="error-text" role="alert"></p>
+      <button id="save-steer" class="primary-button" type="submit">保存修改</button>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

@@ -1,0 +1,7 @@
+#config-dialog { width: min(620px, calc(100vw - 24px)); max-height: calc(100dvh - 32px); overflow-y: auto; }
+#config-dialog .config-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 20px; }
+#config-dialog .config-field p { margin-top: 6px; font-size: 12px; line-height: 1.6; }
+#config-dialog small { color: var(--muted); font-size: 11px; font-weight: normal; white-space: nowrap; }
+#config-dialog .config-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-top: 8px; }
+#config-dialog select { width: 100%; min-width: 0; }
+@media (max-width: 560px) { #config-dialog .config-fields { grid-template-columns: 1fr; gap: 0; } }

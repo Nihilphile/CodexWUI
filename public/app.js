@@ -357,7 +357,7 @@ function renderApprovals() {
 function renderQueue() {
   const q = current()?.queue;
   const html = window.CodexQueue.html(q, state.active, escape);
-  if ($('queue-list').innerHTML !== html) $('queue-list').innerHTML = html;
+  window.CodexQueue.mount($('queue-list'), html);
 }
 function setSteers(id, snapshot) {
   const t = thread(id);

@@ -110,4 +110,19 @@ goals = false
   const created = app.btw.records.get(empty.session.id);
   await until(() => app.live.snapshot(created.threadId)?.turns.some(turn => turn.status === 'completed'));
   assert.equal(inputs.length, 4);
+  // Exercise the actual registry/RPC adapter without remote inference.
+  const listing = await app.agents.execute({ target: directory, cwd: directory, operation: 'list' });
+  assert.ok(listing.agents.some(agent => agent.threadId === parent.id));
+  const standalone = await app.agents.execute({ target: directory, cwd: directory, operation: 'create' });
+  assert.equal(inputs.length, 4, 'agentctl creation does not generate');
+  const call = await app.agents.execute({ target: standalone.agent.agent_id, cwd: directory, operation: 'call', message: 'Exact CLI message\n' });
+  await until(() => app.queue.receipts.get(call.receipt.message_id)?.status === 'delivered' && app.live.snapshot(standalone.agent.threadId)?.turns.some(turn => turn.status === 'completed'));
+  const observed = await app.agents.execute({ target: standalone.agent.agent_id, cwd: directory, operation: 'observe', message_id: call.receipt.message_id });
+  assert.equal(observed.receipt.turn_status, 'completed');
+  assert.ok(inputs.at(-1).input.some(item => item.role === 'user' && JSON.stringify(item.content).includes('Exact CLI message')));
+  const fork = await app.agents.execute({ target: standalone.agent.agent_id, cwd: directory, operation: 'fork' });
+  assert.equal(fork.agent.kind, 'main');
+  assert.notEqual(fork.agent.threadId, standalone.agent.threadId);
+  assert.equal(inputs.length, 5, 'fork does not generate');
+
 });

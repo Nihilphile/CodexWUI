@@ -37,7 +37,7 @@ try {
       if (!info.isFile() || info.size > 800000) throw new Error('消息文件必须是普通文件且不超过 800000 字节');
       const bytes = await readFile(file);
       if (bytes.length > 800000) throw new Error('消息文件过大');
-      message = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      message = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
     }
     if (message !== undefined && (!message.trim() || message.length > 200000)) throw new Error('消息为空或超过 200000 字符；不会截断');
     if (operation === 'call' && message === undefined) throw new Error('call 需要 message 或 message-file');

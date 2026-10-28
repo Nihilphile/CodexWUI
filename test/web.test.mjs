@@ -1449,6 +1449,7 @@ test('BTW restores saved associations after service recreation and reapplies rea
   assert.equal(resume.threadId, record.threadId);
   assert.equal(resume.sandbox, 'read-only');
   assert.equal(resume.approvalPolicy, 'never');
+  await restored.close();
 });
 
 test('BTW keeps per-parent drafts and preserves a failed question', async t => {
@@ -1775,4 +1776,78 @@ test('browser reload saves main and BTW drafts and can be requested while discon
   assert.equal(new Map(saved.btwSelected).get(id), sideId);
   assert.equal(codex.calls.filter(call => call.method === 'turn/start').length, 0);
   assert.deepEqual(errors, []);
+});
+
+test('browser queue edits stay unsent and single continuation leaves other stopped messages intact', async t => {
+  const { window, $, submit, codex, request, errors } = await browserFixture(t);
+  $('new-thread').click(); await until(() => codex.threads.size === 1);
+  const id = [...codex.threads.keys()][0];
+  submit('work'); await until(() => codex.threads.get(id).turns.length === 1);
+  await request(`/api/threads/${id}/queue`, { text: 'first stopped' });
+  await request(`/api/threads/${id}/queue`, { text: 'second stopped' });
+  await request(`/api/threads/${id}/stop`, {});
+  await until(() => $('queue-list').textContent.includes('未发出'));
+  $('queue-list').querySelector('[data-queue-action="edit"]').click();
+  await until(() => $('queue-list').querySelector('textarea'));
+  const textarea = $('queue-list').querySelector('textarea');
+  textarea.value = 'edited first'; textarea.dispatchEvent(new window.Event('input', { bubbles: true }));
+  $('queue-list').querySelector('[data-queue-action="update"]').click();
+  await until(() => !$('queue-list').querySelector('textarea') && $('queue-list').textContent.includes('edited first'));
+  const resume = [...$('queue-list').querySelectorAll('[data-queue-action="run"]')].find(button => button.dataset.entry);
+  resume.click(); await until(() => codex.threads.get(id).turns.length === 2);
+  assert.equal(codex.threads.get(id).turns.at(-1).items[0].content[0].text, 'edited first');
+  codex.complete(id); await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(codex.threads.get(id).turns.length, 2);
+  assert.ok($('queue-list').textContent.includes('second stopped'));
+  $('queue-list').querySelector('[data-queue-action="remove"]').click();
+  await until(() => !$('queue-list').textContent.includes('second stopped'));
+  assert.deepEqual(errors, []);
+});
+
+test('BTW queue supports withdraw edit, delete and explicit continuation', async t => {
+  const { window, $, submit, codex, request, errors } = await browserFixture(t);
+  $('new-thread').click(); await until(() => codex.threads.size === 1);
+  const parent = [...codex.threads.keys()][0];
+  submit('/btw question'); await until(() => codex.calls.some(c => c.method === 'turn/start'));
+  const sessionId = $('btw-select').value;
+  await request(`/api/btw/${parent}/queue`, { sessionId, text: 'side next' });
+  await request(`/api/btw/${parent}/stop`, { sessionId });
+  await until(() => $('btw-pending').querySelector('[data-btw-queue="edit"]'));
+  $('btw-pending').querySelector('[data-btw-queue="edit"]').click();
+  await until(() => $('btw-pending').querySelector('textarea'));
+  const textarea = $('btw-pending').querySelector('textarea');
+  textarea.value = 'revised side'; textarea.dispatchEvent(new window.Event('input', { bubbles: true }));
+  $('btw-pending').querySelector('[data-btw-queue="update"]').click();
+  await until(() => !$('btw-pending').querySelector('textarea'));
+  $('btw-pending').querySelector('[data-btw-queue="run"]').click();
+  await until(() => codex.calls.filter(c => c.method === 'turn/start').length === 2);
+  assert.equal(codex.calls.filter(c => c.method === 'turn/start').at(-1).params.input[0].text, 'revised side');
+  assert.deepEqual(errors, []);
+});
+
+test('thread switching still hydrates history when an older service cannot serve queue.js', async t => {
+  const f = await fixture(t);
+  const first = (await f.request('/api/threads', { project: f.project.id })).body.thread.id;
+  const second = (await f.request('/api/threads', { project: f.project.id })).body.thread.id;
+  await f.request(`/api/threads/${second}/send`, { text: 'target thread history' });
+  f.codex.complete(second);
+  const historyRequests = [];
+  const { window, $, errors } = await browserFixture(t, f, window => {
+    // A failed classic script is skipped by the browser; subsequent scripts run.
+    // Reproduce the live old-process/new-assets deployment where /queue.js is 404.
+    window.document.querySelector('script[src="/queue.js"]')?.remove();
+    const fetch = window.fetch;
+    window.fetch = (url, options) => {
+      if (url === `/api/threads/${second}`) historyRequests.push(url);
+      return fetch(url, options);
+    };
+  });
+  await until(() => window.document.querySelector(`[data-thread="${second}"]`), 'thread sidebar');
+  window.document.querySelector(`[data-thread="${first}"]`).click();
+  window.document.querySelector(`[data-thread="${second}"]`).click();
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.equal(errors.some(message => /reading ['"]html|property ['"]html/.test(message)), false, errors.join('\n'));
+  await until(() => $('messages').textContent.includes('target thread history'), 'switched thread history');
+  assert.ok(historyRequests.length, 'switch must start loading history immediately');
+  assert.equal(errors.some(message => /reading ['"]html|property ['"]html/.test(message)), false, errors.join('\n'));
 });

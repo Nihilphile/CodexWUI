@@ -7,13 +7,16 @@ export const messageDigest = text => createHash('sha256').update(text).digest('h
 export class FollowUpQueue {
   constructor({ run, changed, file, busy = () => false }) {
     Object.assign(this, { run, changed, busy });
-    this.threads = new Map(); this.receipts = new Map();
+    this.threads = new Map(); this.receipts = new Map(); this.running = new Set(); this.closed = false;
     if (file) this.store = new JsonFile(file);
   }
   async load() {
     const saved = await this.store?.read({ threads: [], receipts: [] });
     if (!saved) return;
     this.receipts = new Map(saved.receipts);
+    for (const receipt of this.receipts.values()) if (receipt.status === 'sending') {
+      receipt.status = 'delivery_unknown'; receipt.error = '服务重启，投递结果未知；请检查历史';
+    }
     for (const [id, q] of saved.threads) {
       for (const entry of q.entries) {
         if (entry.status === 'sending') entry.error = '服务重启，投递结果未知；请检查会话后决定是否重发';
@@ -33,7 +36,7 @@ export class FollowUpQueue {
   }
   receipt(id, entry, extra = {}) {
     const value = { ...this.receipts.get(entry.id), message_id: entry.id, threadId: id, status: entry.status, revision: entry.revision,
-      source: entry.source || null, modified: Boolean(entry.modified), bytes: Buffer.byteLength(entry.text), sha256: messageDigest(entry.text), ...extra };
+      source: entry.source || null, error: entry.error || null, modified: Boolean(entry.modified), bytes: Buffer.byteLength(entry.text), sha256: messageDigest(entry.text), ...extra };
     this.receipts.set(entry.id, value);
     return value;
   }
@@ -46,6 +49,7 @@ export class FollowUpQueue {
   flush() { return this.store?.flush() || Promise.resolve(); }
   add(id, input) {
     const q = this.get(id);
+    if (this.closed) throw conflict('服务正在关闭');
     if (q.entries.length >= 20) throw conflict('每个会话最多保留 20 条待发送消息');
     const entry = { ...input, id: randomUUID(), status: 'queued', revision: 1 };
     q.entries.push(entry); q.paused = false;
@@ -73,7 +77,7 @@ export class FollowUpQueue {
     if (entry.status !== 'editing') throw conflict('请先撤回修改');
     if (typeof text !== 'string' || text.length > 200000 || (!text.trim() && !entry.images?.length && !entry.files?.length)) throw conflict('消息内容无效或过长');
     entry.modified ||= entry.text !== text;
-    entry.text = text; entry.status = 'unsent'; entry.revision++;
+    entry.text = text; entry.error = null; entry.status = 'unsent'; entry.revision++;
     this.receipt(id, entry); this.notify(id);
   }
   resume(id, entryId, revision) {
@@ -90,7 +94,19 @@ export class FollowUpQueue {
     q.drainAgain = true;
     if (!q.dispatching) void this.drain(id);
   }
-  async drain(id, explicit = false) {
+  drain(id, explicit = false) {
+    if (this.closed) return Promise.resolve();
+    const task = this.dispatch(id, explicit);
+    this.running.add(task);
+    task.finally(() => this.running.delete(task)).catch(() => {});
+    return task;
+  }
+  async close() {
+    this.closed = true; this.pauseAll();
+    await Promise.allSettled([...this.running]);
+    await this.flush();
+  }
+  async dispatch(id, explicit = false) {
     if (explicit) this.resume(id);
     const q = this.get(id);
     if (q.dispatching || this.busy(id)) return;

@@ -60,7 +60,7 @@ if (args.has('--stop')) {
   }
   const leftovers = await reapProcesses(inventory);
   if (leftovers.length) { console.error(`停止未完成：仍有 ${leftovers.length} 个进程未退出。请检查 Termux 进程状态。`); process.exit(1); }
-  console.log('CodexWeb 已停止，后续消息队列已清空。');
+  console.log('CodexWeb 已停止，后续消息已保留为未发出。');
   process.exit();
 }
 if (args.has('--status')) {

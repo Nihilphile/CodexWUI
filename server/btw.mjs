@@ -37,8 +37,8 @@ export async function readBtwProject(cwd, tool, args) {
 const emptyHistory = () => ({ data: [], nextCursor: null });
 const missingHistory = error => /not materialized yet|no rollout found|thread not loaded/i.test(error.message);
 const textInput = value => {
-  if (typeof value !== 'string' || !value.trim() || value.length > 100000) throw fail(400, 'BTW 消息无效');
-  const text = value.trim();
+  if (typeof value !== 'string' || !value.trim() || value.length > 200000) throw fail(400, 'BTW 消息无效');
+  const text = value;
   return { text, resolvedInput: [{ type: 'text', text, text_elements: [] }] };
 };
 

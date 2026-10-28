@@ -3,7 +3,6 @@ import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { JsonFile } from './persistence.mjs';
-import { messageDigest } from './queue.mjs';
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const operations = new Set(['list', 'observe', 'call', 'stop', 'create', 'fork', 'btw']);
@@ -18,13 +17,14 @@ export class AgentService {
   constructor(options) {
     Object.assign(this, options);
     this.store = new JsonFile(path.join(options.dataDir, 'agents.json'));
-    this.records = new Map(); this.counters = {}; this.serial = Promise.resolve();
+    this.records = new Map(); this.counters = {}; this.owned = new Set(); this.serial = Promise.resolve(); this.requests = new Set(); this.closed = false;
   }
   async load() {
     const value = await this.store.read({ records: [], counters: {} });
-    this.records = new Map(value.records.map(record => [record.key, record])); this.counters = value.counters;
+    this.records = new Map(value.records.map(record => [record.key, record])); this.counters = value.counters; this.owned = new Set(value.owned || []);
   }
-  save() { return this.store.write({ records: [...this.records.values()], counters: this.counters }); }
+  save() { return this.store.write({ records: [...this.records.values()], counters: this.counters, owned: [...this.owned] }); }
+  own(id) { this.owned.add(id); void this.save(); }
   async lock(fn) {
     const result = this.serial.then(fn);
     this.serial = result.catch(() => {}); return result;
@@ -60,28 +60,28 @@ export class AgentService {
     const threads = new Map();
     let cursor = null;
     do {
-      const page = await this.codex.request('thread/list', { cwd: workspace, sourceKinds: sources, modelProviders: [], sortKey: 'created_at', sortDirection: 'asc', limit: 100, cursor });
+      const page = await this.codex.request('thread/list', { sourceKinds: sources, modelProviders: [], sortKey: 'created_at', sortDirection: 'asc', limit: 100, cursor });
       for (const thread of page.data) threads.set(thread.id, thread);
       cursor = page.nextCursor;
     } while (cursor);
-    // Descendants may be omitted by a backend's workspace filtering.
-    for (const root of [...threads.values()].filter(t => !t.parentThreadId && !this.btw.owns(t.id))) {
-      cursor = null;
-      do {
-        const page = await this.codex.request('thread/list', { ancestorThreadId: root.id, sourceKinds: sources, modelProviders: [], limit: 100, cursor, sortKey: 'created_at', sortDirection: 'asc' });
-        for (const thread of page.data) threads.set(thread.id, thread);
-        cursor = page.nextCursor;
-      } while (cursor);
+    for (const [id, value] of this.live.threads) {
+      if (value.metadata?.cwd && this.lifecycle.loaded.has(id)) threads.set(id, { ...threads.get(id), ...value.metadata, status: value.status });
     }
+    // Fetch all source kinds in pages, then group by the root workspace. This
+    // includes children using a different cwd without one RPC per old root.
     await this.lock(async () => {
       const visiting = new Set();
       const add = id => {
         const t = threads.get(id);
         if (!t || this.btw.owns(id) || visiting.has(id)) return this.records.get(id);
+        // A BTW fork can emit thread/started before its side record is saved.
+        // Defer new aliases during that interval instead of mislabelling it main.
+        if (this.btw.locks.size && !this.records.has(id)) return;
+        if (!t.parentThreadId && t.cwd !== workspace) return;
         visiting.add(id);
         const parent = t.parentThreadId ? add(t.parentThreadId) || this.records.get(t.parentThreadId) : null;
-        if (t.parentThreadId && !parent) return;
-        return this.register(id, workspace, { parent, kind: parent ? 'sub' : 'main', managed: this.lifecycle.loaded.has(id), forkedFrom: t.forkedFromId || null });
+        if (t.parentThreadId && (!parent || parent.workspace !== workspace)) return;
+        return this.register(id, workspace, { parent, kind: parent ? 'sub' : 'main', managed: this.lifecycle.loaded.has(id) || this.owned.has(id), forkedFrom: t.forkedFromId || null });
       };
       for (const t of [...threads.values()].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))) add(t.id);
       for (const side of [...this.btw.records.values()].sort((a, b) => a.createdAt - b.createdAt)) {
@@ -97,10 +97,24 @@ export class AgentService {
   async metadata(record) { return record.threadId ? (await this.codex.request('thread/read', { threadId: record.threadId, includeTurns: false })).thread : null; }
   public(record, metadata) {
     const writable = record.managed && metadata?.canAcceptDirectInput !== false;
-    return { ...record, status: metadata?.status || { type: 'notLoaded' }, name: metadata?.name || null,
-      operations: ['observe', ...(writable || record.kind === 'btw' ? ['call', 'stop'] : []), ...(record.kind === 'main' && writable ? ['fork', 'btw'] : [])] };
+    return { ...record, status: metadata?.status || { type: 'notLoaded' }, name: metadata?.name || null, model: metadata?.model || null, reasoning: metadata?.reasoningEffort || null,
+      operations: ['observe', ...(record.managed ? ['stop'] : []), ...(writable || record.kind === 'btw' ? ['call'] : []), ...(record.kind === 'main' && writable ? ['fork', 'btw'] : [])] };
   }
-  async execute(input) {
+  execute(input) {
+    if (this.closed) return Promise.reject(fail(503, '服务正在关闭'));
+    const request = this.handle(input);
+    this.requests.add(request);
+    request.finally(() => this.requests.delete(request)).catch(() => {});
+    return request;
+  }
+  async close() {
+    this.closed = true;
+    await Promise.allSettled([...this.requests]);
+    await this.serial;
+    await this.store.flush();
+  }
+  async handle(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw fail(400, '需要操作参数对象');
     if (!operations.has(input.operation)) throw fail(400, '不支持的操作；不允许代建子代理');
     const allowed = ['target', 'operation', 'cwd', 'caller_thread_id', 'message', 'message_file', 'steer', 'model', 'reasoning', 'message_id', 'reply_to', 'cursor'];
     if (Object.keys(input).some(key => !allowed.includes(key))) throw fail(400, '未知参数；不支持 kind/sub 创建参数');
@@ -109,10 +123,11 @@ export class AgentService {
     if (input.message !== undefined && (typeof input.message !== 'string' || !input.message.trim() || input.message.length > 200000)) throw fail(400, '消息为空或超过 200000 字符');
     if (input.message !== undefined && !['call', 'create', 'fork', 'btw'].includes(input.operation)) throw fail(400, '此操作不接收消息');
     if (input.message_file !== undefined && (typeof input.message_file !== 'string' || input.message_file.length > 4096 || !input.message)) throw fail(400, '文件消息元数据无效');
+    if ((input.message_id !== undefined || input.cursor !== undefined) && input.operation !== 'observe') throw fail(400, 'message-id/cursor 仅用于 observe');
     if (input.reply_to !== undefined && (typeof input.reply_to !== 'string' || !this.queue.receipts.has(input.reply_to))) throw fail(400, 'reply-to 消息不存在');
     const address = await this.address(input.target, input.cwd);
     const { workspace, number } = address;
-    if (input.operation === 'create' && number) throw fail(400, 'create 目标必须是工作区；不允许替其他 agent 创建子代理');
+    if (['create', 'list'].includes(input.operation) && number) throw fail(400, 'create 目标必须是工作区；不允许替其他 agent 创建子代理');
     if (!['list', 'create'].includes(input.operation) && !number) throw fail(400, '此操作需要线程 ID');
     if (input.operation === 'create') await this.addProject(workspace);
     if (!this.projects().some(p => p.path === workspace)) throw fail(403, '请先在 CodexWeb 添加此工作区');
@@ -144,7 +159,12 @@ export class AgentService {
       if (input.message_id && (!receipt || receipt.threadId !== qid)) throw fail(404, '此线程没有该消息回执');
       let history = { data: [], nextCursor: null };
       if (record.kind === 'btw') history = (await this.btw.snapshot(this.btw.records.get(record.sideId).parentId, record.sideId)).history;
-      else if (record.threadId) history = await this.codex.request('thread/turns/list', { threadId: record.threadId, limit: 20, cursor: input.cursor, sortDirection: 'desc', itemsView: 'full' });
+      else if (record.threadId) {
+        try { history = await this.codex.request('thread/turns/list', { threadId: record.threadId, limit: 20, cursor: input.cursor, sortDirection: 'desc', itemsView: 'full' }); }
+        catch (error) {
+          if (input.cursor || metadata?.preview || this.live.get(record.threadId).turns.size || !/no rollout found|not materialized yet/i.test(error.message)) throw error;
+        }
+      }
       const turn = receipt?.turnId && (this.live.get(record.threadId).turns.get(receipt.turnId) || history.data.find(t => t.id === receipt.turnId));
       return { agent: this.public(record, metadata), queue: this.queue.snapshot(qid), ...(receipt ? { receipt: { ...receipt, turn_status: turn?.status || null } } : {}), history };
     }
@@ -169,8 +189,9 @@ export class AgentService {
     if (!input.message) throw fail(400, 'call 需要 message 或 message-file');
     const metadata = await this.metadata(record);
     if (metadata?.canAcceptDirectInput === false) throw fail(409, '后端不允许向此子代理直接发送消息');
-    const qid = this.queueId(record), side = record.sideId && this.btw.records.get(record.sideId);
+    const qid = this.queueId(record);
     const entry = { text: input.message, source, agentDelivery: true };
+    if (record.kind === 'btw' && deliveryText({ ...entry, id: '00000000-0000-0000-0000-000000000000' }).length > 200000) throw fail(400, 'BTW 消息过长');
     if (input.steer) {
       const turnId = record.threadId && this.live.get(record.threadId).activeTurnId;
       if (!turnId) throw fail(409, 'not_running：目标没有正在执行的任务');

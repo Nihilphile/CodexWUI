@@ -42,7 +42,7 @@ export class FakeCodex extends EventEmitter {
       const turns = [...(this.threads.get(params.threadId)?.turns || [])].reverse().slice(0, params.limit || 100);
       return { data: params.itemsView === 'notLoaded' ? turns.map(turn => ({ ...turn, items: [] })) : turns, nextCursor: null };
     }
-    if (method === 'thread/list') return { data: [...this.threads.values()].filter(t => params.ancestorThreadId ? t.parentThreadId === params.ancestorThreadId : (!params.cwd || t.cwd === params.cwd) && !t.parentThreadId), nextCursor: null };
+    if (method === 'thread/list') return { data: [...this.threads.values()].filter(t => params.ancestorThreadId ? t.parentThreadId === params.ancestorThreadId : (!params.cwd || t.cwd === params.cwd) && (!t.parentThreadId || params.sourceKinds?.includes('subAgentThreadSpawn'))), nextCursor: null };
     if (method === 'thread/loaded/list') return { data: [...this.threads.keys()] };
     if (method === 'skills/list') return { data: [{ cwd: this.cwd, skills: [{ name: 'example', path: this.cwd + '/SKILL.md', description: 'Example skill', enabled: true }], errors: [] }] };
     if (method === 'turn/start') {

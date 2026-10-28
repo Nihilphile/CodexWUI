@@ -5,19 +5,26 @@ import os from 'node:os';
 import { buildSubreaper } from './build-subreaper.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const source = path.join(root, 'bin/CodexWeb');
 const directory = process.env.PREFIX ? path.join(process.env.PREFIX, 'bin') : path.join(os.homedir(), '.local/bin');
-const destination = path.join(directory, 'CodexWeb');
-await mkdir(directory, { recursive: true });
-await chmod(source, 0o755);
-try {
-  const existing = await lstat(destination);
-  if (!existing.isSymbolicLink() || await readlink(destination) !== source) throw new Error(`已有 ${destination}，没有覆盖。`);
-} catch (error) {
-  if (error.code !== 'ENOENT') throw error;
-  await symlink(source, destination);
+async function link(source, destination) {
+  await mkdir(path.dirname(destination), { recursive: true });
+  try {
+    const existing = await lstat(destination);
+    if (!existing.isSymbolicLink() || await readlink(destination) !== source) throw new Error(`已有 ${destination}，没有覆盖。`);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    await symlink(source, destination);
+  }
 }
-console.log(`已安装命令：${destination}\n运行 CodexWeb 即可打开本地界面。`);
+for (const name of ['CodexWeb', 'agentctl']) {
+  const source = path.join(root, 'bin', name);
+  await chmod(source, 0o755);
+  await link(source, path.join(directory, name));
+  console.log(`已安装命令：${path.join(directory, name)}`);
+}
+const skill = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'skills/agent-chat');
+await link(path.join(root, 'skills/agent-chat'), skill);
+console.log(`已安装技能：${skill}`);
 if (!(process.env.PATH || '').split(path.delimiter).includes(directory)) console.log(`请将 ${directory} 加入 PATH。`);
 try {
   if (await buildSubreaper()) console.log('已启用孤儿进程回收模块');

@@ -36,12 +36,14 @@ const text = (value, name, max = 10000) => {
 };
 async function body(req) {
   if (!req.headers['content-type']?.startsWith('application/json')) throw httpError(415, '需要 JSON 请求');
-  let raw = '';
+  const chunks = [];
+  let bytes = 0;
   for await (const chunk of req) {
-    raw += chunk;
-    if (Buffer.byteLength(raw) > 1024 * 1024) throw httpError(413, '消息过长');
+    bytes += chunk.length;
+    if (bytes > 1024 * 1024) throw httpError(413, '消息过长');
+    chunks.push(chunk);
   }
-  try { return JSON.parse(raw || '{}'); } catch { throw httpError(400, '无效 JSON'); }
+  try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)) || '{}'); } catch { throw httpError(400, '无效 JSON'); }
 }
 
 export async function createApp({ codex, reload = prepareReload, dataDir = process.env.DATA_DIR || path.join(ROOT, '.data'), initialProject = process.cwd(), limits = resourceLimits(), maxFileBytes = fileUploadLimit() } = {}) {
@@ -176,7 +178,7 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
       const source = sourceId ? await readThread(sourceId) : null;
       model ??= source?.model || config.value.defaultModel;
       effort ??= input.model ? undefined : source?.reasoningEffort || config.value.defaultEffort;
-      if (model || effort) {
+      if (input.model || input.reasoning || (!sourceId && (model || effort))) {
         const catalog = await models();
         const selected = model ? catalog.find(m => m.model === model) : catalog.find(m => m.isDefault);
         if (!selected) throw httpError(400, '请指定当前模型目录中的模型');
@@ -215,7 +217,8 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
       else res.write(wire);
     }
   }
-  codex.on('notification', message => {
+  const onNotification = message => {
+    if (message.method === 'thread/started') agents.own(message.params.thread.id);
     if (['turn/started', 'turn/completed', 'thread/closed'].includes(message.method)) agentTimes.delete(message.params.threadId);
     const request = message.method === 'web/approval' ? message.params : null;
     if (request && btw.owns(request.params?.threadId)) {
@@ -232,12 +235,14 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
       if (starting.has(threadId)) completionPending.set(threadId, turn.status);
       else queue.complete(queueKey(threadId), turn.status);
     }
-  });
-  codex.on('connection', state => {
+  };
+  codex.on('notification', onNotification);
+  const onConnection = state => {
     connectionError = state.error || null;
     if (!state.connected) { loaded.clear(); loading.clear(); lifecycle.disconnect(); queue.pauseAll(); steers.disconnect(); studycards.disconnect(); }
     broadcast({ method: 'web/connection', params: state });
-  });
+  };
+  codex.on('connection', onConnection);
   const startup = codex.start().catch(error => { connectionError = error.message; });
 
   async function ensureLoaded(id) {
@@ -250,7 +255,7 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
           ? { config: visualizationConfig(metadata.cwd, dataDir) } : {}),
       }))
         .then(result => {
-          loaded.add(id); lifecycle.markLoaded(id);
+          loaded.add(id); lifecycle.markLoaded(id); agents.own(id);
           live.get(id).metadata = { ...result.thread, turns: [] };
           return result;
         })
@@ -274,11 +279,11 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
     }
     return skillCache.get(cwd);
   }
-  async function turnInput(id, input, metadata = null) {
+  async function turnInput(id, input, metadata = null, { agentDelivery = false } = {}) {
     if (typeof input.text !== 'string' || input.text.length > 200000) throw httpError(400, '消息无效');
     const prompt = input.source ? deliveryText(input) : input.text.trim();
     metadata ||= await readThread(id);
-    if ((metadata.parentThreadId && !input.agentDelivery) || metadata.canAcceptDirectInput === false) throw httpError(409, '子代理会话在这里仅供查看');
+    if ((metadata.parentThreadId && !agentDelivery) || metadata.canAcceptDirectInput === false) throw httpError(409, '子代理会话在这里仅供查看');
     if (!projects.some(p => p.path === metadata.cwd)) throw httpError(403, '请先添加这个会话所属的项目目录');
     const fileInputs = await attachments.inputs(input.files);
     const imageInputs = await images.inputs(input.images);
@@ -301,7 +306,7 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
     let capture;
     try {
       const metadata = await readThread(id);
-      const items = await turnInput(id, input, metadata);
+      const items = await turnInput(id, input, metadata, { agentDelivery: input.agentDelivery });
       await ensureLoaded(id);
       items.push({ type: 'text', text: VISUALIZE_INSTRUCTIONS, text_elements: [] });
       capture = await studycards.prepare(id, metadata.cwd);
@@ -699,7 +704,6 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
         '/file-preview.js': ['file-preview.js', 'text/javascript'],
         '/file-preview.css': ['file-preview.css', 'text/css'],
         '/markdown.js': ['markdown.js', 'text/javascript'],
-        '/queue.js': ['queue.js', 'text/javascript'],
         '/visualizations.js': ['visualizations.js', 'text/javascript'],
         '/visualizations.css': ['visualizations.css', 'text/css'],
         '/vendor/markdown-it.min.js': ['vendor/markdown-it.min.js', 'text/javascript'],
@@ -723,11 +727,13 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
     if (closePromise) return closePromise;
     lifecycle.close();
     steers.close();
-    queue.pauseAll();
+    codex.off('notification', onNotification);
+    codex.off('connection', onConnection);
+    const queueClosed = queue.close();
     for (const res of clients) res.end();
     const httpClosed = new Promise(resolve => server.close(() => resolve()));
     server.closeAllConnections();
-    closePromise = Promise.all([codex.close(), httpClosed, studycards.close(), config.queue.catch(() => {}), queue.flush(), agents.store.flush()]).then(([result]) => result);
+    closePromise = Promise.all([codex.close(), httpClosed, studycards.close(), config.queue.catch(() => {}), queueClosed, agents.close()]).then(([result]) => result);
     return closePromise;
   }
   server.on('close', () => { void close(); });

@@ -2,14 +2,16 @@ import { mkdir, open, rename, unlink } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { appEnv } from './environment.mjs';
 
 export const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const ID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}--[^/\\\x00-\x1f\x7f]{1,180}$/u;
 const error = (status, message) => Object.assign(new Error(message), { status });
 
 export function fileUploadLimit(env = process.env) {
-  const mb = env.CODEXWEB_MAX_FILE_MB === undefined ? MAX_FILE_BYTES / (1024 * 1024) : Number(env.CODEXWEB_MAX_FILE_MB);
-  if (!Number.isSafeInteger(mb) || mb < 1 || !Number.isSafeInteger(mb * 1024 * 1024)) throw new Error('CODEXWEB_MAX_FILE_MB 必须是有效的正整数（MiB）');
+  const value = appEnv(env, 'MAX_FILE_MB');
+  const mb = value === undefined ? MAX_FILE_BYTES / (1024 * 1024) : Number(value);
+  if (!Number.isSafeInteger(mb) || mb < 1 || !Number.isSafeInteger(mb * 1024 * 1024)) throw new Error('CODEXWUI_MAX_FILE_MB 必须是有效的正整数（MiB）');
   return mb * 1024 * 1024;
 }
 

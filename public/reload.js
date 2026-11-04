@@ -21,13 +21,13 @@ window.CodexServiceReload = class {
           const check = await this.fetch('/api/bootstrap', { cache: 'no-store', signal: AbortSignal.timeout(2000) });
           if (!check.ok) continue;
           const next = await check.json();
-          if (next.app !== 'termux-codex-web' || !next.serverInstance || next.serverInstance === result.serverInstance) continue;
+          if (!['codexwui', 'termux-codex-web'].includes(next.app) || !next.serverInstance || next.serverInstance === result.serverInstance) continue;
           if (!next.connected && !next.error) { this.status('新服务已启动，正在连接 Codex…'); continue; }
           this.status('后端已恢复，正在刷新…');
           this.refresh(); return;
         } catch { /* The port is expected to be unavailable during shutdown. */ }
       }
-      throw new Error('重启等待超时，草稿已保留。请稍后刷新；若服务未恢复，请在 Termux 运行 CodexWeb --no-open。');
+      throw new Error('重启等待超时，草稿已保留。请稍后刷新；若服务未恢复，请在 Termux 运行 codexwui --no-open。');
     } catch (error) {
       this.running = false;
       this.status(error.message, true);

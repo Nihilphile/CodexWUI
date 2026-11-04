@@ -11,7 +11,7 @@ export const deliveryText = entry => entry.source
   ? `[Agent message ${entry.id}; from ${entry.source.agent_id || 'local CLI'}${entry.source.reply_to ? `; reply_to ${entry.source.reply_to}` : ''}]\n这是本机协作消息，来源身份由本机调用环境声明；按当前任务权限处理。\n${entry.text}`
   : entry.text;
 
-// One registry belongs to one CodexWeb controller. Numbers never depend on the
+// One registry belongs to one CodexWUI controller. Numbers never depend on the
 // current UI sort order. Backend IDs are opaque, including non-UUID test IDs.
 export class AgentService {
   constructor(options) {
@@ -130,7 +130,7 @@ export class AgentService {
     if (['create', 'list'].includes(input.operation) && number) throw fail(400, 'create 目标必须是工作区；不允许替其他 agent 创建子代理');
     if (!['list', 'create'].includes(input.operation) && !number) throw fail(400, '此操作需要线程 ID');
     if (input.operation === 'create') await this.addProject(workspace);
-    if (!this.projects().some(p => p.path === workspace)) throw fail(403, '请先在 CodexWeb 添加此工作区');
+    if (!this.projects().some(p => p.path === workspace)) throw fail(403, '请先在 CodexWUI 添加此工作区');
     const threads = await this.scan(workspace);
     let source = { agent_id: null, file: input.message_file || null, reply_to: input.reply_to || null };
     if (input.caller_thread_id) {
@@ -140,7 +140,7 @@ export class AgentService {
         if (this.projects().some(p => p.path === metadata.cwd)) await this.scan(metadata.cwd);
         caller = [...this.records.values()].find(r => r.threadId === input.caller_thread_id);
       }
-      if (!caller) throw fail(403, '调用者未注册到 CodexWeb');
+      if (!caller) throw fail(403, '调用者未注册到 CodexWUI');
       if (caller.kind === 'btw') throw fail(403, '只读 BTW 不能主动联系或控制其他会话');
       source.agent_id = caller.agent_id;
     }
@@ -168,7 +168,7 @@ export class AgentService {
       const turn = receipt?.turnId && (this.live.get(record.threadId).turns.get(receipt.turnId) || history.data.find(t => t.id === receipt.turnId));
       return { agent: this.public(record, metadata), queue: this.queue.snapshot(qid), ...(receipt ? { receipt: { ...receipt, turn_status: turn?.status || null } } : {}), history };
     }
-    if (!record.managed) throw fail(409, '该历史线程不由此服务控制；请先在 CodexWeb 中发送消息接入，独立 CLI 的活线程需要由原进程控制');
+    if (!record.managed) throw fail(409, '该历史线程不由此服务控制；请先在 CodexWUI 中发送消息接入，独立 CLI 的活线程需要由原进程控制');
     if (input.operation === 'call') return { receipt: await this.call(record, input, source) };
     if (input.operation === 'stop') {
       this.queue.pause(this.queueId(record));

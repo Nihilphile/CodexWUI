@@ -1,5 +1,5 @@
 {
-  "name": "termux-codex-web",
+  "name": "codexwui",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -8,15 +8,19 @@
     "start": "node server/index.mjs",
     "setup": "node scripts/install.mjs",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check server/config.mjs && node --check public/config.js && node --check server/index.mjs && node --check server/codex.mjs && node --check server/supervisor.mjs && node --check server/processes.mjs && node --check server/lifecycle.mjs && node --check server/limits.mjs && node --check server/runtime.mjs && node --check server/state.mjs && node --check server/queue.mjs && node --check scripts/launch.mjs && node --check server/git.mjs && node --check server/files.mjs && node --check server/reload.mjs && node --check scripts/reload.mjs && node --check public/reload.js && node --check server/btw.mjs && node --check server/btw-mcp.mjs && node --check public/btw.js && node --check server/attachments.mjs && node --check server/images.mjs && node --check server/steers.mjs && node --check public/files.js && node --check public/file-preview.js && node --check public/app.js && node --check server/subreaper.mjs && node --check scripts/build-subreaper.mjs && node --check scripts/install.mjs && node --check public/markdown.js && node --check scripts/vendor-rendering.mjs && node --check server/studycards.mjs && node --check server/visualizations.mjs && node --check server/visualize-mcp.mjs && node --check public/visualizations.js && node --check public/visualization-runtime.js && node --check server/persistence.mjs && node --check server/agents.mjs && node --check scripts/agentctl.mjs",
+    "check": "node --check server/recovery.mjs && node --check server/turn-history.mjs && node --check server/account-quota.mjs && node --check public/quota.js && node --check server/plugins.mjs && node --check public/plugins.js && node --check server/environment.mjs && node --check server/config.mjs && node --check public/config.js && node --check server/index.mjs && node --check server/codex.mjs && node --check server/supervisor.mjs && node --check server/processes.mjs && node --check server/lifecycle.mjs && node --check server/limits.mjs && node --check server/runtime.mjs && node --check server/state.mjs && node --check server/authority.mjs && node --check server/thread-usage.mjs && node --check server/queue.mjs && node --check scripts/launch.mjs && node --check server/git.mjs && node --check server/files.mjs && node --check server/reload.mjs && node --check scripts/reload.mjs && node --check public/reload.js && node --check server/btw.mjs && node --check server/btw-mcp.mjs && node --check public/btw.js && node --check server/attachments.mjs && node --check server/images.mjs && node --check server/steers.mjs && node --check public/files.js && node --check public/file-preview.js && node --check public/file-links.js && node --check public/pdf-viewer.js && node --check public/app.js && node --check server/subreaper.mjs && node --check scripts/build-subreaper.mjs && node --check scripts/install.mjs && node --check public/markdown.js && node --check public/mermaid.js && node --check public/mermaid-renderer.js && node --check scripts/vendor-rendering.mjs && node --check server/studycards.mjs && node --check server/visualizations.mjs && node --check server/visualize-mcp.mjs && node --check public/visualizations.js && node --check public/visualization-runtime.js && node --check server/persistence.mjs && node --check server/agents.mjs && node --check scripts/agentctl.mjs && node --check server/studycard-html.mjs && node --check server/terminals.mjs && node --check scripts/build-terminal.mjs && node --check public/terminal.js",
     "vendor:rendering": "node scripts/vendor-rendering.mjs"
   },
   "engines": {
     "node": ">=22"
   },
   "devDependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
     "jsdom": "^30.1.2",
     "katex": "0.19.1",
-    "markdown-it": "15.0.3"
+    "markdown-it": "15.0.3",
+    "mermaid": "12.3.0",
+    "pdfjs-dist": "6.4.299"
   }
 }

@@ -1,4 +1,4 @@
-# Termux Codex Web
+# CodexWUI
 
 在手机上管理本地编码工作与 Codex 会话。
 

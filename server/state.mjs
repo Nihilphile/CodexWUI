@@ -76,11 +76,13 @@ export class LiveState {
     if (!turnId) return;
     if (!t.turns.has(turnId)) t.turns.set(turnId, { id: turnId, status: 'inProgress', items: new Map() });
     const turn = t.turns.get(turnId);
+    if (message.method === 'error') { turn.retrying = Boolean(p.willRetry); turn.failure = p.failure; }
     if (message.method === 'turn/started') {
       t.activeTurnId = turnId; t.status = { type: 'active', activeFlags: [] };
       turn.startedAt = p.turn.startedAt ?? Date.now() / 1000;
     }
     if (message.method === 'turn/completed') {
+      turn.retrying = false; turn.failure = p.turn.failure; turn.recoveryMode = p.turn.recoveryMode;
       turn.status = p.turn.status; turn.error = p.turn.error;
       turn.completedAt = p.turn.completedAt ?? turn.completedAt ?? Date.now() / 1000;
       if (t.activeTurnId === turnId) t.activeTurnId = null;

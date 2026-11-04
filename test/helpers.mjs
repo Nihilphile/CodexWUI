@@ -8,7 +8,7 @@ export class FakeCodex extends EventEmitter {
   event(method, params) { this.emit('notification', { method, params }); }
   async request(method, params) {
     this.calls.push({ method, params });
-    if (method === 'config/read') return { config: { mcp_servers: { dangerous: { enabled: true } }, plugins: {} } };
+    if (method === 'config/read') return { config: { mcp_servers: { dangerous: { enabled: true } }, plugins: {}, sandbox_mode: 'workspace-write', approval_policy: 'on-request', sandbox_workspace_write: { network_access: false, writable_roots: [] } } };
     if (method === 'model/list') {
       const data = [
         { id: 'catalog-fast', model: 'test-fast', displayName: 'Fast', description: 'Fast model', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Quick' }, { reasoningEffort: 'medium', description: 'Balanced' }], defaultReasoningEffort: 'medium' },
@@ -24,7 +24,12 @@ export class FakeCodex extends EventEmitter {
       const source = this.threads.get(params.threadId);
       if (!source) throw new Error('Unknown thread');
       if (!source.turns.length) throw new Error(`no rollout found for thread id ${params.threadId}`);
-      const turns = structuredClone(source.turns);
+      let turns = structuredClone(source.turns);
+      if (params.lastTurnId || params.beforeTurnId) {
+        const index = turns.findIndex(turn => turn.id === (params.lastTurnId || params.beforeTurnId));
+        if (index < 0 || turns[index].status === 'inProgress') throw new Error('Invalid fork boundary');
+        turns = turns.slice(0, index + (params.beforeTurnId ? 0 : 1));
+      }
       if (turns.at(-1)?.status === 'inProgress') turns.at(-1).status = 'interrupted';
       const thread = { ...source, id: `thread-${++this.next}`, forkedFromId: source.id, turns, status: { type: 'idle' } };
       this.threads.set(thread.id, thread); this.event('thread/started', { thread }); return { thread };
@@ -32,22 +37,40 @@ export class FakeCodex extends EventEmitter {
     if (method === 'thread/read' || method === 'thread/resume') {
       const thread = this.threads.get(params.threadId); if (!thread) throw new Error('Unknown thread'); return { thread };
     }
+    if (method === 'thread/name/set') {
+      this.threads.get(params.threadId).name = params.name;
+      return {};
+    }
     if (method === 'thread/settings/update') {
       const thread = this.threads.get(params.threadId);
-      thread.model = params.model; thread.reasoningEffort = params.effort;
+      if (params.model !== undefined) thread.model = params.model;
+      if (params.effort !== undefined) thread.reasoningEffort = params.effort;
+      if (params.permissions !== undefined) thread.permissions = params.permissions;
+      if (params.sandboxPolicy !== undefined) { thread.sandboxPolicy = params.sandboxPolicy; delete thread.permissions; }
+      if (params.approvalPolicy !== undefined) thread.approvalPolicy = params.approvalPolicy;
       this.event('thread/settings/updated', { threadId: thread.id, threadSettings: { model: thread.model, effort: thread.reasoningEffort } });
       return {};
     }
     if (method === 'thread/turns/list') {
-      const turns = [...(this.threads.get(params.threadId)?.turns || [])].reverse().slice(0, params.limit || 100);
-      return { data: params.itemsView === 'notLoaded' ? turns.map(turn => ({ ...turn, items: [] })) : turns, nextCursor: null };
+      const all = [...(this.threads.get(params.threadId)?.turns || [])];
+      if (params.sortDirection !== 'asc') all.reverse();
+      const offset = Number(params.cursor) || 0, end = offset + (params.limit || 100);
+      const turns = all.slice(offset, end);
+      return { data: params.itemsView === 'notLoaded' ? turns.map(turn => ({ ...turn, items: [] })) : turns, nextCursor: end < all.length ? String(end) : null };
+    }
+    if (method === 'thread/items/list') {
+      const all = (this.threads.get(params.threadId)?.turns || []).filter(turn => !params.turnId || turn.id === params.turnId).flatMap(turn => turn.items.map(item => ({ turnId: turn.id, item })));
+      const offset = Number(params.cursor) || 0, end = offset + (params.limit || 100);
+      return { data: all.slice(offset, end), nextCursor: end < all.length ? String(end) : null };
     }
     if (method === 'thread/list') return { data: [...this.threads.values()].filter(t => params.ancestorThreadId ? t.parentThreadId === params.ancestorThreadId : (!params.cwd || t.cwd === params.cwd) && (!t.parentThreadId || params.sourceKinds?.includes('subAgentThreadSpawn'))), nextCursor: null };
     if (method === 'thread/loaded/list') return { data: [...this.threads.keys()] };
     if (method === 'skills/list') return { data: [{ cwd: this.cwd, skills: [{ name: 'example', path: this.cwd + '/SKILL.md', description: 'Example skill', enabled: true }], errors: [] }] };
     if (method === 'turn/start') {
       const thread = this.threads.get(params.threadId);
-      const turn = { id: `turn-${++this.next}`, model: thread.model, effort: thread.reasoningEffort, status: 'inProgress', items: [{ type: 'userMessage', id: `user-${this.next}`, content: params.input }], error: null };
+      if (params.model) thread.model = params.model;
+      if (params.effort) thread.reasoningEffort = params.effort;
+      const turn = { id: `turn-${++this.next}`, model: thread.model, effort: thread.reasoningEffort, status: 'inProgress', items: [{ type: 'userMessage', id: `user-${this.next}`, clientId: params.clientUserMessageId, content: params.input }], error: null };
       thread.turns.push(turn); thread.status = { type: 'active' };
       this.event('turn/started', { threadId: thread.id, turn });
       this.event('item/started', { threadId: thread.id, turnId: turn.id, item: turn.items[0] });

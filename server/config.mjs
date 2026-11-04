@@ -1,10 +1,12 @@
 import { readFile, writeFile, rename, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { appEnv } from './environment.mjs';
+import { AUTHORITY_CHOICES } from './authority.mjs';
 
 const error = (status, message) => Object.assign(new Error(message), { status });
-export const CONFIG_KEYS = ['maxActiveTurns', 'maxProcesses', 'maxRssMb', 'idleMinutes', 'maxFileMb', 'defaultModel', 'defaultEffort'];
-const ENV_KEYS = { maxActiveTurns: 'CODEXWEB_MAX_ACTIVE_TURNS', maxProcesses: 'CODEXWEB_MAX_PROCESSES', maxRssMb: 'CODEXWEB_MAX_RSS_MB', idleMinutes: 'CODEXWEB_IDLE_MINUTES', maxFileMb: 'CODEXWEB_MAX_FILE_MB' };
+export const CONFIG_KEYS = ['maxActiveTurns', 'maxProcesses', 'maxRssMb', 'idleMinutes', 'maxFileMb', 'defaultModel', 'defaultEffort', 'defaultAuthority', 'fileExpandMode'];
+const ENV_KEYS = { maxActiveTurns: 'MAX_ACTIVE_TURNS', maxProcesses: 'MAX_PROCESSES', maxRssMb: 'MAX_RSS_MB', idleMinutes: 'IDLE_MINUTES', maxFileMb: 'MAX_FILE_MB' };
 
 export function validateConfig(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw error(400, '配置必须是对象');
@@ -19,6 +21,8 @@ export function validateConfig(value) {
     if (value[key] !== null && (typeof value[key] !== 'string' || !value[key].trim() || value[key].length > 200)) throw error(400, `${key} 无效`);
   }
   if (!value.defaultModel && value.defaultEffort) throw error(400, '请先选择默认模型，再设置推理强度');
+  if (!AUTHORITY_CHOICES.includes(value.defaultAuthority)) throw error(400, '会话初始权限无效');
+  if (!['panel', 'fullscreen'].includes(value.fileExpandMode)) throw error(400, '文件展开形式必须是工作区面板或全屏');
   return { ...value };
 }
 
@@ -32,9 +36,9 @@ export class AppConfig {
   constructor({ dataDir, limits, maxFileBytes, env = process.env }) {
     this.file = path.join(dataDir, 'config.json');
     this.instance = randomUUID();
-    this.base = validateConfig({ maxActiveTurns: limits.maxActiveTurns, maxProcesses: limits.maxProcesses, maxRssMb: limits.maxRssMb, idleMinutes: limits.idleMs / 60000, maxFileMb: maxFileBytes / (1024 * 1024), defaultModel: null, defaultEffort: null });
+    this.base = validateConfig({ maxActiveTurns: limits.maxActiveTurns, maxProcesses: limits.maxProcesses, maxRssMb: limits.maxRssMb, idleMinutes: limits.idleMs / 60000, maxFileMb: maxFileBytes / (1024 * 1024), defaultModel: null, defaultEffort: null, defaultAuthority: 'default', fileExpandMode: 'panel' });
     this.queue = Promise.resolve(); this.revision = 0; this.saved = {};
-    this.sources = Object.fromEntries(CONFIG_KEYS.map(key => [key, env[ENV_KEYS[key]] === undefined ? 'default' : 'environment']));
+    this.sources = Object.fromEntries(CONFIG_KEYS.map(key => [key, ENV_KEYS[key] && appEnv(env, ENV_KEYS[key]) !== undefined ? 'environment' : 'default']));
     this.value = { ...this.base };
   }
   async load() {

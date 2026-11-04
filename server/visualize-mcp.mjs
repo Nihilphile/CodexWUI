@@ -24,7 +24,7 @@ for await (const line of lines) {
   if (message.id === undefined) continue;
   try {
     let result;
-    if (message.method === 'initialize') result = { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'CodexWeb Visualize', version: '1.0.0' } };
+    if (message.method === 'initialize') result = { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'CodexWUI Visualize', version: '1.0.0' } };
     else if (message.method === 'ping') result = {};
     else if (message.method === 'tools/list') result = { tools: [VISUALIZE_TOOL] };
     else if (message.method === 'resources/list') result = { resources: [] };

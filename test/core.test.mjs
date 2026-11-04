@@ -103,7 +103,7 @@ test('follow-up send failure preserves the draft for retry', async () => {
 });
 
 test('Git shows staged/unstaged changes, renames and unusual file names without changing the index', async t => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'codex-web-git-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const dir = await mkdtemp(path.join(tmpdir(), 'codexwui-git-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
   git('init', '-q'); await writeFile(path.join(dir, 'space name.md'), 'before\n');
   git('add', '.'); git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'initial');
@@ -121,6 +121,6 @@ test('Git shows staged/unstaged changes, renames and unusual file names without 
 });
 
 test('non-repository project has a readable Git empty state', async t => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'codex-web-nogit-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const dir = await mkdtemp(path.join(tmpdir(), 'codexwui-nogit-')); t.after(() => rm(dir, { recursive: true, force: true }));
   assert.equal((await gitStatus(dir)).available, false);
 });

@@ -112,7 +112,7 @@ for (const [name, overrides, reason] of [
 }
 
 test('invalid resource limits fail before any backend can be launched', () => {
-  for (const key of ['CODEXWEB_MAX_PROCESSES', 'CODEXWEB_MAX_RSS_MB', 'CODEXWEB_MAX_ACTIVE_TURNS', 'CODEXWEB_IDLE_MINUTES']) {
+  for (const key of ['CODEXWUI_MAX_PROCESSES', 'CODEXWUI_MAX_RSS_MB', 'CODEXWUI_MAX_ACTIVE_TURNS', 'CODEXWUI_IDLE_MINUTES']) {
     for (const value of ['0', '-1', 'NaN', '1.5', 'Infinity']) assert.throws(() => resourceLimits({ [key]: value }), /正整数/);
   }
 });

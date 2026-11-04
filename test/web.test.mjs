@@ -12,7 +12,7 @@ import { FakeCodex } from './helpers.mjs';
 import { resourceLimits } from '../server/limits.mjs';
 
 async function fixture(t, options = {}) {
-  const dir = await mkdtemp(path.join(tmpdir(), 'codex-web-http-'));
+  const dir = await mkdtemp(path.join(tmpdir(), 'codexwui-http-'));
   const codex = new FakeCodex(dir);
   const app = await createApp({ codex, initialProject: dir, dataDir: path.join(dir, 'data'), ...options });
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening'); await app.startup;
@@ -31,7 +31,7 @@ const until = async (predicate, description = 'condition') => {
 };
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK1sAAAAASUVORK5CYII=', 'base64');
-const withoutVisualizationGuide = input => input.filter(item => !item.text?.startsWith('[CodexWeb visualization instructions]\n'));
+const withoutVisualizationGuide = input => input.filter(item => !item.text?.startsWith('[CodexWUI visualization instructions]\n'));
 
 test('simultaneous sends reserve tablet capacity before async validation and resume after completion', async t => {
   const { request, project, codex } = await fixture(t);
@@ -392,6 +392,61 @@ test('late file/directory responses neither overwrite another project nor steal 
   assert.equal(panel.current.dir, 'new'); assert.equal(panel.directory().entries[0].name, 'new');
 });
 
+test('history collapse gives chat and inspector equal widths and preserves the choice while navigating', async t => {
+  const { window, $, codex, errors } = await browserFixture(t, undefined, window => {
+    Object.defineProperty(window, 'innerWidth', { value: 1400, configurable: true, writable: true });
+  });
+  const style = window.document.createElement('style');
+  style.textContent = await readFile(new URL('../public/styles.css', import.meta.url), 'utf8');
+  window.document.head.append(style);
+  assert.equal($('sidebar').hidden, false);
+  $('close-sidebar').click(); assert.equal($('sidebar').hidden, true);
+  assert.equal($('open-sidebar').getAttribute('aria-expanded'), 'false');
+  $('toggle-inspector').click(); assert.equal($('inspector').hidden, false);
+  assert.equal(window.document.body.classList.contains('inspector-open'), true);
+  assert.equal($('inspector-scrim').hidden, true);
+  const css = window.getComputedStyle(window.document.querySelector('.workspace'));
+  assert.equal(css.flexBasis, '50%'); assert.equal(css.width, '50%');
+  assert.equal(window.getComputedStyle($('inspector')).flexBasis, '50%');
+  $('new-thread').click(); await until(() => codex.threads.size === 1 && !$('new-thread').disabled);
+  assert.equal($('sidebar').hidden, true, 'opening a conversation preserves the collapsed desktop list');
+  window.innerWidth = 720; window.dispatchEvent(new window.Event('resize'));
+  assert.equal($('inspector-scrim').hidden, true); assert.equal(window.getComputedStyle($('inspector')).position, 'relative');
+  $('open-sidebar').click(); assert.equal($('sidebar').hidden, false); assert.equal($('inspector').hidden, true);
+  assert.equal($('scrim').hidden, false);
+  $('scrim').click(); assert.equal($('sidebar').hidden, true);
+  $('toggle-inspector').click(); assert.equal($('inspector-scrim').hidden, true);
+  $('close-inspector').click(); assert.equal(window.document.body.classList.contains('inspector-open'), false);
+  assert.equal($('toggle-inspector').getAttribute('aria-expanded'), 'false');
+  assert.deepEqual(errors, []);
+});
+
+test('file expansion follows live config and closing the workspace removes the expanded overlay', async t => {
+  const { window, $, dir, errors } = await browserFixture(t, undefined, window => {
+    Object.defineProperty(window, 'innerWidth', { value: 1400, configurable: true });
+  });
+  await writeFile(path.join(dir, 'page.html'), '<h1>Hello</h1>');
+  $('toggle-inspector').click();
+  await until(() => $('files-view').querySelector('[data-file-entry="page.html"]'));
+  $('files-view').querySelector('[data-file-entry="page.html"]').click();
+  const root = $('files-view'); await until(() => !root.querySelector('.file-card-preview').hidden);
+  const frame = root.querySelector('.file-card-preview'), src = frame.src;
+  root.querySelector('[data-file-expand]').click(); assert.equal(root.classList.contains('file-expanded'), true);
+  assert.equal(root.dataset.expandMode, 'panel');
+  $('open-config').click(); await until(() => $('config-dialog').open && !$('config-form').querySelector('[data-config-save]').disabled);
+  $('config-fileExpandMode').value = 'fullscreen'; $('config-form').querySelector('[data-config-save]').click();
+  await until(() => root.dataset.expandMode === 'fullscreen');
+  assert.equal($('inspector').classList.contains('file-fullscreen-host'), true);
+  assert.equal(root.querySelector('.file-card-preview'), frame); assert.equal(frame.src, src);
+  $('config-dialog').close();
+  $('close-inspector').click(); assert.equal(root.classList.contains('file-expanded'), false);
+  assert.equal($('inspector').classList.contains('file-fullscreen-host'), false);
+  $('toggle-inspector').click(); root.querySelector('[data-file-expand]').click();
+  window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  assert.equal(root.classList.contains('file-expanded'), false);
+  assert.deepEqual(errors, []);
+});
+
 test('external links may navigate to the homepage but cannot access APIs or embed the app', async t => {
   const { base } = await fixture(t);
   const get = (route, headers) => new Promise((resolve, reject) => {
@@ -544,6 +599,136 @@ async function browserFixture(t, existing, configureWindow) {
   return { ...f, window, $, submit, errors };
 }
 
+test('conversation initially renders five turns and reveals earlier turns on upward scroll without moving the reader', async t => {
+  const { window, $, request, project, codex, errors, app } = await browserFixture(t);
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  codex.threads.get(id).turns = Array.from({ length: 12 }, (_, index) => ({
+    id: `history-${index + 1}`, status: 'completed', items: [
+      { id: `question-${index + 1}`, type: 'userMessage', content: [{ type: 'text', text: `Question ${index + 1}` }] },
+      { id: `answer-${index + 1}`, type: 'agentMessage', text: `Answer ${index + 1}` },
+    ],
+  }));
+  const artifact = await app.visualizations.publish(project.path, { type: 'html', content: '<button>Keep interaction</button>', title: 'History interaction' });
+  codex.threads.get(id).turns[9].items.push({ id: 'history-viz', type: 'mcpToolCall', server: 'codexwui_visualize', tool: 'visualize', status: 'completed', result: { structuredContent: artifact } });
+  const scroller = $('message-scroll');
+  Object.defineProperties(scroller, { scrollHeight: { configurable: true, get: () => $('messages').querySelectorAll('.message.user').length * 100 }, clientHeight: { configurable: true, value: 200 } });
+  await window.selectThread(id);
+  await until(() => $('messages').textContent.includes('Answer 12'));
+  await until(() => $('messages').querySelector('iframe'));
+  const frame = $('messages').querySelector('iframe');
+  assert.equal($('messages').querySelectorAll('.message.user').length, 5);
+  assert.equal($('messages').textContent.includes('Answer 7'), false);
+  assert.equal($('more-turns').hidden, false);
+  scroller.scrollTop = 20; scroller.dispatchEvent(new window.Event('scroll'));
+  await until(() => $('messages').querySelectorAll('.message.user').length === 10);
+  assert.equal(scroller.scrollTop, 520, 'prepended turns must preserve the reader position');
+  assert.equal($('messages').querySelector('iframe'), frame);
+  $('more-turns').click();
+  await until(() => $('messages').querySelectorAll('.message.user').length === 12);
+  assert.equal($('more-turns').hidden, true);
+  scroller.scrollTop = 200;
+  await request(`/api/threads/${id}/send`, { text: 'New turn while reading history' });
+  await until(() => $('messages').textContent.includes('New turn while reading history'));
+  assert.equal(scroller.scrollTop, 200);
+  assert.ok($('messages').textContent.includes('Answer 1'));
+  assert.equal($('messages').querySelector('iframe'), frame);
+  assert.deepEqual(errors, []);
+});
+
+test('older-turn requests are deduplicated and cannot replace the conversation selected while loading', async t => {
+  const { window, $, request, project, codex, errors } = await browserFixture(t);
+  const a = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const b = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const history = Array.from({ length: 30 }, (_, index) => ({ id: `page-${index}`, status: 'completed', items: [{ id: `page-answer-${index}`, type: 'agentMessage', text: `Paged answer ${index}` }] }));
+  codex.threads.get(a).turns = history;
+  const original = codex.request.bind(codex); let release, pages = 0;
+  codex.request = async (method, params) => {
+    if (method === 'thread/turns/list' && params.threadId === a) {
+      if (params.cursor) { pages++; await new Promise(resolve => { release = resolve; }); }
+      const offset = Number(params.cursor || 0), all = [...history].reverse();
+      return { data: all.slice(offset, offset + params.limit), nextCursor: offset + params.limit < all.length ? String(offset + params.limit) : null };
+    }
+    return original(method, params);
+  };
+  await window.selectThread(a);
+  await until(() => $('messages').querySelectorAll('.message.assistant').length === 5);
+  for (const count of [10, 15, 20]) { $('more-turns').click(); await until(() => $('messages').querySelectorAll('.message.assistant').length === count); }
+  assert.equal(pages, 0, 'cached turns must be revealed before requesting another page');
+  $('more-turns').click(); await until(() => release);
+  $('message-scroll').dispatchEvent(new window.WheelEvent('wheel', { deltaY: -10 }));
+  await window.selectThread(b); await until(() => !$('messages').textContent.includes('Paged answer'));
+  release(); await new Promise(resolve => setTimeout(resolve, 150));
+  assert.equal(pages, 1);
+  assert.equal($('messages').textContent.includes('Paged answer'), false);
+  await window.selectThread(a); await until(() => $('messages').textContent.includes('Paged answer 5'));
+  assert.equal($('messages').querySelectorAll('.message.assistant').length, 25, 'a fetched page reveals only the next five turns');
+  assert.deepEqual(errors, []);
+});
+
+test('BTW history pages stop at the fork boundary across more than one hundred side turns', async t => {
+  const { request, project, codex } = await fixture(t);
+  const parent = (await request('/api/threads', { project: project.id })).body.thread.id;
+  await request(`/api/threads/${parent}/send`, { text: 'Inherited parent question' }); codex.complete(parent);
+  const record = (await request(`/api/btw/${parent}/open`, {})).body.session;
+  const side = codex.threads.get(record.threadId);
+  side.turns.push(...Array.from({ length: 115 }, (_, index) => ({ id: `paged-side-${index}`, status: 'completed', items: [{ id: `paged-side-answer-${index}`, type: 'agentMessage', text: `Side answer ${index}` }] })));
+  const original = codex.request.bind(codex);
+  codex.request = async (method, params) => {
+    if (method === 'thread/turns/list' && params.threadId === side.id) {
+      const offset = Number(params.cursor || 0), all = [...side.turns].reverse(), data = all.slice(offset, offset + params.limit);
+      return { data: params.itemsView === 'notLoaded' ? data.map(turn => ({ ...turn, items: [] })) : data, nextCursor: offset + params.limit < all.length ? String(offset + params.limit) : null };
+    }
+    return original(method, params);
+  };
+  const first = (await request(`/api/btw/${parent}?session=${record.id}`)).body;
+  assert.equal(first.history.data.length, 100); assert.equal(first.history.nextCursor, '100');
+  const older = await request(`/api/btw/${parent}?session=${record.id}&cursor=${first.history.nextCursor}`);
+  assert.equal(older.status, 200); assert.equal(older.body.history.data.length, 15);
+  assert.equal(older.body.history.nextCursor, null);
+  assert.ok(older.body.history.data.every(turn => turn.id.startsWith('paged-side-')));
+});
+
+test('main and BTW stream concurrently with independent five-turn windows and render scheduling', async t => {
+  const { window, $, request, project, codex, submit, errors } = await browserFixture(t);
+  $('new-thread').click(); await until(() => codex.threads.size === 1);
+  const parent = [...codex.threads.keys()][0];
+  submit('/btw'); await until(() => $('btw-select').options.length === 1 && !$('btw-prompt').disabled);
+  const sessionId = $('btw-select').value;
+  await request(`/api/threads/${parent}/send`, { text: 'Main question' });
+  const sent = await request(`/api/btw/${parent}/send`, { sessionId, text: 'Side question' });
+  const side = [...codex.threads.keys()].find(id => id !== parent), mainTurn = codex.threads.get(parent).turns.at(-1);
+  const sideTurn = codex.threads.get(side).turns.at(-1);
+  assert.equal(sent.status, 200);
+  const seeded = Array.from({ length: 8 }, (_, index) => ({ id: `side-history-${index}`, status: 'completed', items: [{ id: `side-old-${index}`, type: 'agentMessage', text: `Side history ${index}` }] }));
+  codex.threads.get(side).turns.unshift(...seeded);
+  $('btw-select').dispatchEvent(new window.Event('change'));
+  await until(() => $('messages').textContent.includes('Main question') && $('btw-messages').textContent.includes('Side history 7'));
+  assert.equal($('btw-messages').querySelectorAll('[data-btw-bring]').length, 4, 'only four completed side turns plus the active turn are initially visible');
+  await new Promise(resolve => setTimeout(resolve, 180));
+  let mainRenders = 0, sideRenders = 0;
+  const renderMain = window.renderMessages, renderSide = window.CodexBtwPanel.prototype.render;
+  window.renderMessages = () => { mainRenders++; return renderMain(); };
+  window.CodexBtwPanel.prototype.render = function (...args) { sideRenders++; return renderSide.apply(this, args); };
+  const delta = (threadId, turnId, itemId, text) => codex.event('item/agentMessage/delta', { threadId, turnId, itemId, delta: text });
+  for (let index = 0; index < 20; index++) delta(side, sideTurn.id, 'side-live', `side${index} `);
+  await until(() => $('btw-messages').textContent.includes('side19'));
+  await new Promise(resolve => setTimeout(resolve, 130));
+  assert.equal(mainRenders, 0, 'side output must not redraw the main conversation');
+  assert.ok(sideRenders <= 2, 'side deltas must be batched');
+  mainRenders = 0; sideRenders = 0;
+  for (let index = 0; index < 20; index++) delta(parent, mainTurn.id, 'main-live', `main${index} `);
+  await until(() => $('messages').textContent.includes('main19'));
+  assert.equal(sideRenders, 0, 'main output must not redraw BTW');
+  assert.ok(mainRenders <= 2);
+  delta(side, sideTurn.id, 'side-live', 'Side simultaneous');
+  delta(parent, mainTurn.id, 'main-live', 'Main simultaneous');
+  await until(() => $('btw-messages').textContent.includes('Side simultaneous') && $('messages').textContent.includes('Main simultaneous'));
+  $('btw-messages').scrollTop = 0; $('btw-messages').dispatchEvent(new window.WheelEvent('wheel', { deltaY: -10 }));
+  await until(() => $('btw-messages').textContent.includes('Side history 0'));
+  assert.equal($('messages').querySelectorAll('.message.user').length, 1);
+  assert.deepEqual(errors, []);
+});
+
 test('visualize renders HTML, Markdown and images in tool positions while hiding calls and preserving mounted frames', async t => {
   const { app, window, $, submit, codex, project, request, dir, errors } = await browserFixture(t);
   submit('展示交互解释');
@@ -554,7 +739,7 @@ test('visualize renders HTML, Markdown and images in tool positions while hiding
   const md = await app.visualizations.publish(project.path, { type: 'markdown', title: '说明', content: '# 标题\n\n$x^2$\n\n<script>unsafe()</script>' });
   const image = await app.visualizations.publish(project.path, { type: 'image', path: 'plot.png', title: '轨道图' });
   for (const [index, artifact] of [html, md, image].entries()) {
-    const item = { id: `visual-${index}`, type: 'mcpToolCall', server: 'codexweb_visualize', tool: 'visualize', status: 'completed', arguments: { type: artifact.type, content: 'HTML SOURCE' }, result: { structuredContent: artifact } };
+    const item = { id: `visual-${index}`, type: 'mcpToolCall', server: index === 0 ? 'codexweb_visualize' : 'codexwui_visualize', tool: 'visualize', status: 'completed', arguments: { type: artifact.type, content: 'HTML SOURCE' }, result: { structuredContent: artifact } };
     turn.items.push(item); codex.event('item/completed', { threadId: thread.id, turnId: turn.id, item });
   }
   await until(() => $('messages').querySelector('iframe') && $('messages').querySelector('.visualization-content h1') && $('messages').querySelector('.visualization-content img'));
@@ -562,9 +747,9 @@ test('visualize renders HTML, Markdown and images in tool positions while hiding
   assert.equal($('messages').querySelectorAll('.visualization-card').length, 3);
   assert.ok($('messages').querySelector('.visualization-content .katex'));
   assert.equal($('messages').querySelector('.visualization-content script'), null);
-  assert.ok(!$('messages').textContent.includes('codexweb_visualize'));
+  assert.ok(!$('messages').textContent.includes('codexwui_visualize'));
   assert.ok(!$('messages').textContent.includes('HTML SOURCE'));
-  assert.ok(!$('messages').textContent.includes('CodexWeb visualization instructions'));
+  assert.ok(!$('messages').textContent.includes('CodexWUI visualization instructions'));
   const answer = { id: 'answer-after-visualize', type: 'agentMessage', text: '' };
   turn.items.push(answer); codex.event('item/started', { threadId: thread.id, turnId: turn.id, item: answer });
   codex.event('item/agentMessage/delta', { threadId: thread.id, turnId: turn.id, itemId: answer.id, delta: '这是解释文字。' });
@@ -641,7 +826,8 @@ test('returning to the foreground recovers missed completion even after a stream
   $('prompt').value = 'unfinished draft';
   hidden = true; window.document.dispatchEvent(new window.Event('visibilitychange'));
   stalled = true; source.onerror(new Error('network paused'));
-  await until(() => $('connection-label').textContent !== 'Codex 已连接');
+  await new Promise(resolve => setTimeout(resolve, 130));
+  assert.equal($('connection-label').textContent, 'Codex 已连接', 'hidden pages defer DOM updates until they become visible');
   const answer = { id: 'finished-answer', type: 'agentMessage', text: 'finished while backgrounded' };
   a.turns[0].items.push(answer); codex.complete(a.id);
   const readsBefore = codex.calls.filter(call => call.method === 'thread/read').length;
@@ -743,8 +929,8 @@ test('a hung recovery read times out, coalesces focus events and permits a later
   assert.deepEqual(errors, []);
 });
 
-test('StudyCard archives only enabled turns and file panel endpoints expose saved Markdown', async t => {
-  const { app, request, project, codex, dir } = await fixture(t);
+test('StudyCard archives only enabled turns and file endpoints preview HTML in an isolated sandbox', async t => {
+  const { app, request, project, codex, dir, base } = await fixture(t);
   const id = (await request('/api/threads', { project: project.id })).body.thread.id;
   const feature = `/api/threads/${id}/studycard`;
   assert.equal((await request(feature)).body.studycard.enabled, false);
@@ -761,12 +947,28 @@ test('StudyCard archives only enabled turns and file panel endpoints expose save
   const snapshot = (await request(`/api/threads/${id}`)).body.studycard;
   assert.equal(snapshot.results[0].status, 'saved');
   const relative = snapshot.results[0].path;
-  assert.equal(await readFile(path.join(dir, relative), 'utf8'), '# list\n完整正文。');
+  const source = await readFile(path.join(dir, relative), 'utf8');
+  assert.match(source, /<h1>list<\/h1>\n<p>完整正文。<\/p>/);
   const listed = await request(`/api/files/list?project=${project.id}&path=StudyCard/Python语法/容器`);
-  assert.equal(listed.body.entries[0].name, 'list.md');
+  assert.equal(listed.body.entries[0].name, 'list.html');
   const preview = await request(`/api/files/preview?project=${project.id}&path=${encodeURIComponent(relative)}`);
-  assert.equal(preview.body.kind, 'markdown');
-  assert.equal(preview.body.text, '# list\n完整正文。');
+  assert.equal(preview.body.kind, 'studycard');
+  const runtime = await fetch(`${base}/api/files/studycard?project=${project.id}&path=${encodeURIComponent(relative)}`);
+  assert.equal(runtime.status, 200);
+  assert.match(runtime.headers.get('content-type'), /text\/html/);
+  assert.match(runtime.headers.get('content-security-policy'), /sandbox allow-scripts/);
+  assert.doesNotMatch(runtime.headers.get('content-security-policy'), /allow-same-origin/);
+  assert.equal(await runtime.text(), source);
+  const legacy = source.replace('CodexWUI StudyCard v1', 'CodexWeb StudyCard v1');
+  await writeFile(path.join(dir, 'StudyCard/legacy.html'), legacy);
+  assert.equal((await request(`/api/files/preview?project=${project.id}&path=StudyCard/legacy.html`)).body.kind, 'studycard');
+  const legacyRuntime = await fetch(`${base}/api/files/studycard?project=${project.id}&path=StudyCard/legacy.html`);
+  assert.equal(legacyRuntime.status, 200);
+  assert.equal(await legacyRuntime.text(), legacy);
+  await writeFile(path.join(dir, 'ordinary.html'), '<script>unsafe()</script>');
+  assert.equal((await request(`/api/files/studycard?project=${project.id}&path=ordinary.html`)).status, 400);
+  await writeFile(path.join(dir, 'StudyCard/not-a-card.html'), '<script>unsafe()</script>');
+  assert.equal((await request(`/api/files/studycard?project=${project.id}&path=StudyCard/not-a-card.html`)).status, 400);
   assert.equal((await request(feature, { enabled: false }, { headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' } })).status, 403);
 });
 
@@ -782,7 +984,7 @@ test('StudyCard snapshots switches at dispatch, refreshes the tree for follow-up
   codex.event('item/completed', { threadId: id, turnId: turn.id, item: { type: 'agentMessage', phase: 'final_answer', text: 'StudyCard: Python/list\n\nfirst answer' } });
   codex.complete(id);
   await until(() => codex.threads.get(id).turns.length === 2);
-  assert.match(codex.calls.filter(call => call.method === 'turn/start').at(-1).params.input.at(-1).text, /"list.md"/);
+  assert.match(codex.calls.filter(call => call.method === 'turn/start').at(-1).params.input.at(-1).text, /"list.html"/);
   await request(`/api/threads/${id}/queue`, { text: 'after stop' });
   await request(feature, { enabled: false });
   turn = codex.threads.get(id).turns.at(-1);
@@ -828,7 +1030,7 @@ test('browser StudyCard commands, hidden host instructions, archive links and ex
   assert.equal(codex.calls.some(call => call.method === 'turn/start'), false, 'command does not send a model turn');
   submit('解释列表'); await until(() => thread.turns.length === 1);
   await until(() => $('messages').textContent.includes('解释列表'));
-  assert.doesNotMatch($('messages').textContent, /CodexWeb StudyCard instructions|现有目录树/);
+  assert.doesNotMatch($('messages').textContent, /CodexWUI StudyCard instructions|现有目录树/);
   const turn = thread.turns[0];
   turn.items.push({ id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'StudyCard: Python/list\n\n# 列表\n解释正文。' });
   codex.complete(id); await app.studycards.close();
@@ -839,8 +1041,14 @@ test('browser StudyCard commands, hidden host instructions, archive links and ex
   $('files-view').querySelector('[data-file-entry="StudyCard"]').click();
   await until(() => $('files-view').querySelector('[data-file-entry="StudyCard/Python"]'));
   $('files-view').querySelector('[data-file-entry="StudyCard/Python"]').click();
-  await until(() => $('files-view').querySelector('[data-file-entry="StudyCard/Python/list.md"]'));
-  $('files-view').querySelector('[data-file-entry="StudyCard/Python/list.md"]').click();
+  await until(() => $('files-view').querySelector('[data-file-entry="StudyCard/Python/list.html"]'));
+  $('files-view').querySelector('[data-file-entry="StudyCard/Python/list.html"]').click();
+  await until(() => !$('files-view').querySelector('.file-card-preview').hidden);
+  assert.equal($('files-view').querySelector('.file-card-preview').getAttribute('sandbox'), 'allow-scripts');
+  assert.match($('files-view').querySelector('.file-card-preview').src, /\/api\/files\/studycard\?/);
+  assert.equal($('files-view').querySelector('.file-raw').hidden, true);
+  $('files-view').querySelector('[data-file-card-source]').click();
+  assert.equal($('files-view').querySelector('.file-raw').hidden, false);
   await until(() => $('files-view').querySelector('.file-raw').textContent.includes('解释正文。'));
   submit('/sTuDyCaRd --STATUS'); await until(() => $('toast').textContent.includes('保存目录：'));
   submit('/StudyCard --stop'); await until(() => !$('breadcrumb').textContent.includes('StudyCard 已开启'));
@@ -977,6 +1185,29 @@ test('agent links reach a rendered browser preview with source toggle, relative 
   assert.deepEqual(errors, []);
 });
 
+test('Mermaid renders locally in an opaque frame while session APIs remain protected', async t => {
+  const { base } = await fixture(t);
+  const page = await fetch(base + '/mermaid-renderer.html');
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get('x-frame-options'), null);
+  const policy = page.headers.get('content-security-policy');
+  assert.match(policy, /sandbox allow-scripts;/);
+  assert.doesNotMatch(policy, /allow-same-origin/);
+  assert.match(policy, /connect-src 'none'/);
+  assert.match(policy, /script-src 'self'/);
+  const headers = { Origin: 'null', 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Dest': 'script' };
+  for (const route of ['/mermaid-renderer.js', '/vendor/mermaid/mermaid.min.js']) {
+    const response = await fetch(base + route, { headers });
+    assert.equal(response.status, 200, route);
+    assert.match(response.headers.get('content-type'), /javascript/);
+    assert.ok((await response.arrayBuffer()).byteLength > 0);
+  }
+  for (const route of ['/api/bootstrap', '/api/threads', '/app.js']) {
+    assert.equal((await fetch(base + route, { headers })).status, 403, route);
+  }
+  assert.equal((await fetch(base + '/vendor/mermaid/missing.js')).status, 404);
+});
+
 test('served CSP permits KaTeX inline geometry while keeping scripts and stylesheets restricted', async t => {
   const { base, window } = await browserFixture(t);
   const page = await fetch(base + '/');
@@ -998,7 +1229,11 @@ test('served CSP permits KaTeX inline geometry while keeping scripts and stylesh
   const attributes = directives.get('style-src-attr') || directives.get('style-src') || directives.get('default-src');
   assert.ok(attributes.includes("'unsafe-inline'"), 'browser CSP blocks the inline heights and offsets needed by fractions and subscripts');
   const stylesheets = directives.get('style-src-elem') || directives.get('style-src') || directives.get('default-src');
-  assert.deepEqual(stylesheets, ["'self'"]);
+  assert.equal(stylesheets[0], "'self'");
+  assert.equal(stylesheets.length, 2);
+  assert.match(stylesheets[1], /^'nonce-[A-Za-z0-9+/]+'$/);
+  const nonce = (await page.text()).match(/name="terminal-style-nonce" content="([^"]+)"/)?.[1];
+  assert.equal(stylesheets[1], `'nonce-${nonce}'`, 'only terminal-generated style elements carry the response nonce');
   assert.deepEqual(directives.get('script-src'), ["'self'"]);
   assert.deepEqual(directives.get('default-src'), ["'self'"]);
 });
@@ -1052,6 +1287,99 @@ test('local math assets, streaming answers, history and BTW use the shared rende
   assert.deepEqual(restored.errors, []);
 });
 
+test('account quota flows through HTTP to the sidebar and dialog, prefers five hours and follows notifications', async t => {
+  const f = await fixture(t);
+  const original = f.codex.request.bind(f.codex);
+  const resetsAt = Math.floor(Date.now() / 1000) + 86400;
+  let bucket = { limitId: 'codex', planType: 'pro', primary: { usedPercent: 26, windowDurationMins: 10080, resetsAt }, secondary: null };
+  let reads = 0, fail = false;
+  f.codex.request = async (method, ...args) => {
+    if (method !== 'account/rateLimits/read') return original(method, ...args);
+    reads++;
+    if (fail) throw new Error('额度暂不可用');
+    return { rateLimits: bucket };
+  };
+  const { $, window, errors } = await browserFixture(t, f);
+  await until(() => $('account-quota').textContent === '周剩余 74%');
+  $('prompt').value = '保留草稿';
+  $('account-quota').click();
+  assert.equal($('quota-dialog').open, true);
+  assert.equal($('quota-plan').textContent, 'PRO · Codex 账户额度');
+  assert.equal($('quota-weekly-remaining').textContent, '剩余 74%');
+  assert.equal($('quota-weekly-progress').value, 74);
+  assert.match($('quota-weekly-reset').textContent, /重置/);
+  assert.equal($('quota-five-hour-reset').textContent, '当前账户未提供此项额度');
+  assert.equal($('quota-five-hour-progress').hidden, true);
+  await until(() => !$('refresh-quota').disabled);
+  assert.equal(reads, 1, 'opening details uses the shared cache');
+  bucket = { ...bucket, secondary: { usedPercent: 91, windowDurationMins: 300, resetsAt } };
+  $('refresh-quota').click();
+  await until(() => $('account-quota').textContent === '5h剩余 9%');
+  assert.equal(reads, 2, 'manual refresh bypasses the cache');
+  assert.equal($('quota-weekly-remaining').textContent, '剩余 74%');
+  assert.equal($('quota-five-hour-remaining').textContent, '剩余 9%');
+  assert.equal($('account-quota').classList.contains('quota-low'), true);
+  bucket = { ...bucket, primary: { usedPercent: 30, windowDurationMins: 10080, resetsAt }, secondary: null };
+  f.codex.event('account/rateLimits/updated', { rateLimits: bucket });
+  await until(() => $('account-quota').textContent === '周剩余 70%');
+  assert.equal(reads, 2, 'notifications update the server cache without an extra RPC');
+  assert.equal($('account-quota').classList.contains('quota-low'), false);
+  fail = true;
+  $('refresh-quota').click();
+  await until(() => $('quota-status').textContent === '额度暂不可用');
+  assert.equal($('account-quota').textContent, '额度 --');
+  assert.equal($('toast').hidden, true);
+  fail = false;
+  $('refresh-quota').click();
+  await until(() => $('account-quota').textContent === '周剩余 70%');
+  $('close-quota-dialog').click(); assert.equal($('quota-dialog').open, false);
+  f.codex.fail(new Error('backend stopped'));
+  await until(() => /未连接/.test($('quota-status').textContent));
+  assert.equal($('account-quota').textContent, '额度 --');
+  assert.equal((await f.request('/api/account/quota')).status, 503);
+  assert.equal($('prompt').value, '保留草稿');
+  assert.deepEqual(errors, []);
+});
+
+test('account quota pauses polling when hidden, deduplicates requests and discards old account responses', async t => {
+  const f = await fixture(t);
+  const original = f.codex.request.bind(f.codex);
+  const resetsAt = Math.floor(Date.now() / 1000) + 86400;
+  f.codex.request = async (method, ...args) => method === 'account/rateLimits/read'
+    ? { rateLimits: { primary: { usedPercent: 20, windowDurationMins: 300, resetsAt }, secondary: { usedPercent: 40, windowDurationMins: 10080, resetsAt } } }
+    : original(method, ...args);
+  let poll, hidden = false, requests = 0, hold = false, release;
+  const { $, window, errors } = await browserFixture(t, f, window => {
+    const interval = window.setInterval.bind(window);
+    window.setInterval = (callback, ms, ...args) => {
+      if (ms === 60000) { poll = callback; return 0; }
+      return interval(callback, ms, ...args);
+    };
+    Object.defineProperty(window.document, 'hidden', { get: () => hidden, configurable: true });
+    const fetch = window.fetch;
+    window.fetch = async (url, options) => {
+      if (!url.startsWith('/api/account/quota')) return fetch(url, options);
+      requests++;
+      const response = await fetch(url, options);
+      if (hold) await new Promise(resolve => { release = resolve; });
+      return response;
+    };
+  });
+  await until(() => $('account-quota').textContent === '5h剩余 80%');
+  hidden = true; const before = requests; poll(); assert.equal(requests, before);
+  hidden = false; hold = true; poll(); await until(() => release);
+  poll(); poll(); assert.equal(requests, before + 1);
+  f.codex.event('account/updated', { authMode: null, planType: null });
+  hold = false;
+  f.codex.request = async (method, ...args) => method === 'account/rateLimits/read' ? {} : original(method, ...args);
+  await until(() => $('quota-five-hour-reset').textContent === '当前账户未提供此项额度');
+  release();
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal($('account-quota').textContent, '额度 --', 'an old account response must not restore its quota');
+  assert.equal($('quota-weekly-reset').textContent, '当前账户未提供此项额度');
+  assert.deepEqual(errors, []);
+});
+
 test('sidebar RAM uses cached totals and polls without overlap, pauses when hidden and handles failure quietly', async t => {
   const f = await fixture(t, { limits: resourceLimits({}) });
   f.codex.resources = { rssMb: 1229, sampledAt: Date.now() };
@@ -1075,7 +1403,7 @@ test('sidebar RAM uses cached totals and polls without overlap, pauses when hidd
   });
   await until(() => $('memory-usage').textContent === 'RAM 1.2/4G');
   assert.equal($('connection-label').nextElementSibling, $('memory-usage'));
-  assert.equal($('memory-usage').nextElementSibling.textContent, 'LOCALHOST');
+  assert.equal($('memory-usage').nextElementSibling, $('account-quota'));
   $('prompt').value = '保留正在输入的草稿';
   hidden = true; poll(); assert.equal(requests, 0);
   f.codex.resources = { rssMb: 2560, sampledAt: Date.now() };
@@ -1170,6 +1498,256 @@ test('HTTP steer editing is versioned and a late recall cannot undo an already s
   assert.equal(codex.calls.filter(call => call.method === 'turn/steer').length, 1);
 });
 
+test('slash skill suggestions and direct slash/dollar invocations resolve to the same explicit skill input', async t => {
+  const { codex, dir, window, $, submit, errors } = await browserFixture(t);
+  $('command-menu').click();
+  await until(() => $('suggestions').querySelector('[data-skill]'));
+  assert.equal($('suggestions').querySelector('[data-skill] strong').textContent, '/skill：example');
+  assert.ok($('suggestions').querySelector('[data-command="help"]'));
+  $('prompt').value = '/exam'; $('prompt').dispatchEvent(new window.Event('input'));
+  assert.equal($('suggestions').querySelectorAll('[data-command]').length, 0);
+  assert.equal($('suggestions').querySelectorAll('[data-skill]').length, 1);
+  $('suggestions').querySelector('[data-skill]').click();
+  await until(() => $('prompt').value === '$example ');
+  assert.equal($('prompt').value, '$example ');
+  assert.match($('skill-chips').textContent, /\$example/);
+  assert.equal($('suggestions').hidden, true);
+  submit($('prompt').value + 'chosen from slash menu');
+  await until(() => codex.calls.some(c => c.method === 'turn/start') && !$('send').disabled && $('prompt').value === '');
+  const id = [...codex.threads.keys()][0];
+  const first = codex.calls.find(c => c.method === 'turn/start');
+  assert.equal(withoutVisualizationGuide(first.params.input)[0].text, '$example chosen from slash menu');
+  assert.deepEqual(withoutVisualizationGuide(first.params.input)[1], { type: 'skill', name: 'example', path: dir + '/SKILL.md' });
+  await until(() => !$('send-mode').hidden);
+  for (const text of ['/example direct slash', '$example direct dollar', '/example', '/skill: example explicit skill', '/skill：example\nKeep the whole task below']) {
+    codex.complete(id);
+    await until(() => $('send-mode').hidden);
+    const before = codex.calls.filter(c => c.method === 'turn/start').length;
+    submit(text);
+    await until(() => codex.calls.filter(c => c.method === 'turn/start').length === before + 1 && !$('send').disabled && $('prompt').value === '' && !$('send-mode').hidden, text);
+    const input = withoutVisualizationGuide(codex.calls.filter(c => c.method === 'turn/start').at(-1).params.input);
+    assert.equal(input[0].text, text.replace(/^\/skill[:：][ \t]*/, '$').replace(/^\//, '$'));
+    assert.deepEqual(input[1], { type: 'skill', name: 'example', path: dir + '/SKILL.md' });
+    assert.equal(input.filter(i => i.type === 'skill').length, 1);
+  }
+  assert.deepEqual(errors, []);
+});
+
+test('slash command button inserts a command line and choosing config preserves all draft text and skill selection', async t => {
+  const { codex, window, $, submit, errors } = await browserFixture(t);
+  $('skill-menu').click(); await until(() => $('suggestions').querySelector('[data-skill]'));
+  $('suggestions').querySelector('[data-skill]').click(); await until(() => $('prompt').value === '$example ');
+  Object.defineProperty($('file-input'), 'files', { configurable: true, value: [new File(['keep this attachment'], 'notes.txt', { type: 'text/plain' })] });
+  $('file-input').dispatchEvent(new window.Event('change'));
+  await until(() => $('image-attachments').textContent.includes('notes.txt') && !$('send').disabled);
+  const draft = '$example 这段草稿还没有写完。\n\n第二段保留空格  \n';
+  $('prompt').value = draft; $('prompt').dispatchEvent(new window.Event('input'));
+  $('command-menu').click(); await until(() => $('prompt').value === `/\n${draft}`);
+  assert.equal($('prompt').selectionStart, 1);
+  $('command-menu').click(); await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal($('prompt').value, `/\n${draft}`, 'reopening does not prepend another command line');
+  $('suggestions').querySelector('[data-command="config"]').click();
+  await until(() => $('config-dialog').open);
+  assert.equal($('prompt').value, draft);
+  assert.match($('skill-chips').textContent, /\$example/);
+  assert.match($('image-attachments').textContent, /notes.txt/);
+  assert.equal(codex.threads.size, 0);
+  $('config-dialog').close();
+  submit($('prompt').value);
+  await until(() => codex.calls.some(call => call.method === 'turn/start'));
+  const input = withoutVisualizationGuide(codex.calls.find(call => call.method === 'turn/start').params.input);
+  assert.equal(input[0].text, draft.trim());
+  assert.equal(input[1].type, 'skill');
+  assert.ok(input.some(item => item.type === 'text' && item.text.includes('notes.txt')));
+  assert.deepEqual(errors, []);
+});
+
+test('typed action commands consume only the first line, preserve drafts during async execution and restore failed commands', async t => {
+  const f = await fixture(t);
+  let hold = false, release;
+  const { codex, window, $, submit, errors } = await browserFixture(t, f, window => {
+    const fetch = window.fetch;
+    window.fetch = async (url, options) => {
+      if (hold && url === '/api/config' && !options?.method) await new Promise(resolve => { release = resolve; });
+      return fetch(url, options);
+    };
+  });
+  const draft = '保留第一段。\n\n保留第二段和末尾空格  \n';
+  $('prompt').value = `/config\n${draft}`; $('prompt').dispatchEvent(new window.Event('input'));
+  assert.equal($('send').textContent, '执行 /config');
+  $('prompt').value = `/skill: example\n${draft}`; $('prompt').dispatchEvent(new window.Event('input'));
+  assert.equal($('send').textContent, '发送 ↑');
+  hold = true;
+  submit(`/config  \r\n${draft}`); await until(() => release);
+  assert.equal($('prompt').value, draft);
+  $('prompt').value += '等待设置期间继续写。'; $('prompt').dispatchEvent(new window.Event('input'));
+  hold = false; release();
+  await until(() => $('config-dialog').open && !$('config-form').querySelector('[data-config-save]').disabled);
+  assert.equal($('prompt').value, draft + '等待设置期间继续写。');
+  $('config-dialog').close();
+  submit(`/help\n${draft}`); await until(() => $('prompt').value === draft);
+  assert.equal(codex.threads.size, 0);
+  const failed = `/stop\n${draft}`;
+  submit(failed); await until(() => /请先选择一个会话/.test($('toast').textContent));
+  assert.equal($('prompt').value, failed);
+  codex.fail(new Error('offline'));
+  await until(() => $('send').disabled);
+  submit(`/config\n${draft}`); await until(() => $('config-dialog').open);
+  assert.equal($('prompt').value, draft);
+  assert.equal(codex.calls.filter(call => call.method === 'turn/start').length, 0);
+  assert.deepEqual(errors, []);
+});
+
+test('choosing a slash skill keeps the task below its command line and sends both together', async t => {
+  const { codex, $, submit, errors } = await browserFixture(t);
+  const draft = '检查异常处理。\n保留这条具体要求。';
+  $('prompt').value = draft;
+  $('command-menu').click(); await until(() => $('suggestions').querySelector('[data-skill]'));
+  $('suggestions').querySelector('[data-skill]').click();
+  await until(() => $('prompt').value === `$example \n${draft}`);
+  submit($('prompt').value);
+  await until(() => codex.calls.some(call => call.method === 'turn/start'));
+  const input = withoutVisualizationGuide(codex.calls.find(call => call.method === 'turn/start').params.input);
+  assert.equal(input[0].text, `$example \n${draft}`);
+  assert.equal(input[1].type, 'skill');
+  assert.deepEqual(errors, []);
+});
+
+test('opening model settings carries an unsent draft into its implicit new thread while explicit new preserves the old draft', async t => {
+  const { codex, window, $, submit, errors } = await browserFixture(t);
+  const draft = '先选择模型，然后继续写的草稿。';
+  submit(`/model\n${draft}`); await until(() => $('model-dialog').open);
+  assert.equal($('prompt').value, draft);
+  const originalId = [...codex.threads.keys()][0];
+  $('model-dialog').close();
+  submit(`/new\n${draft}`); await until(() => codex.threads.size === 2 && !$('new-thread').disabled);
+  assert.equal($('prompt').value, '');
+  await until(() => $('thread-list').querySelector(`[data-thread="${originalId}"]`));
+  $('thread-list').querySelector(`[data-thread="${originalId}"]`).click();
+  await until(() => $('prompt').value === draft);
+  assert.equal(codex.calls.filter(call => call.method === 'turn/start').length, 0);
+  assert.deepEqual(errors, []);
+});
+
+test('commands with arguments consume their first line while preserving the main draft', async t => {
+  const { codex, $, submit, errors } = await browserFixture(t);
+  $('new-thread').click(); await until(() => codex.threads.size === 1 && !$('new-thread').disabled);
+  const parent = [...codex.threads.keys()][0];
+  const draft = '这部分仍是主会话的草稿。\n第二段也不发送。';
+  submit(`/StudyCard --status\n${draft}`);
+  await until(() => /StudyCard/.test($('toast').textContent));
+  assert.equal($('prompt').value, draft);
+  submit(`/btw 只解释这个问题\n${draft}`);
+  await until(() => codex.calls.some(call => call.method === 'turn/start'));
+  assert.equal($('prompt').value, draft);
+  const call = codex.calls.find(call => call.method === 'turn/start');
+  assert.notEqual(call.params.threadId, parent);
+  assert.ok(call.params.input.some(item => item.type === 'text' && item.text === '只解释这个问题'));
+  assert.ok(!JSON.stringify(call.params.input).includes(draft));
+  assert.deepEqual(errors, []);
+});
+
+test('slash skills preserve builtin commands, support namespaces, and require a menu choice for duplicate names', async t => {
+  const f = await fixture(t);
+  const original = f.codex.request.bind(f.codex);
+  const skills = [
+    { name: 'help', path: f.dir + '/help/SKILL.md', description: 'Help skill' },
+    { name: 'plugin:skill-one', path: f.dir + '/plugin/SKILL.md', description: '<img src=x onerror=alert(1)>' },
+    { name: 'same', path: f.dir + '/a/SKILL.md', description: 'Source A' },
+    { name: 'same', path: f.dir + '/b/SKILL.md', description: 'Source B' },
+  ];
+  f.codex.request = async (method, ...args) => method === 'skills/list' ? { data: [{ cwd: f.dir, skills, errors: [] }] } : original(method, ...args);
+  const { codex, window, $, submit, errors } = await browserFixture(t, f);
+  $('prompt').value = '/h'; $('prompt').dispatchEvent(new window.Event('input'));
+  await until(() => $('suggestions').querySelector('[data-skill]'));
+  assert.equal($('suggestions').querySelector('[data-command] strong').textContent, '/help');
+  assert.equal($('suggestions').querySelector('[data-skill] strong').textContent, '/skill：help');
+  submit('/help'); await until(() => $('prompt').value === '');
+  assert.equal(codex.threads.size, 0, '/help runs the builtin instead of the skill');
+  assert.match($('toast').textContent, /\/技能名 或 \$技能名/);
+  submit('/not-a-command'); await until(() => /不支持该命令/.test($('toast').textContent));
+  assert.equal($('prompt').value, '/not-a-command');
+  assert.equal(codex.threads.size, 0);
+  $('prompt').value = '/plugin:s'; $('prompt').dispatchEvent(new window.Event('input'));
+  assert.equal($('suggestions').querySelector('[data-skill] strong').textContent, '/skill：plugin:skill-one');
+  assert.equal($('suggestions').querySelector('img'), null);
+  submit('/plugin:skill-one do the task');
+  await until(() => codex.calls.some(c => c.method === 'turn/start') && $('prompt').value === '' && !$('send').disabled);
+  const input = withoutVisualizationGuide(codex.calls.find(c => c.method === 'turn/start').params.input);
+  assert.equal(input[0].text, '$plugin:skill-one do the task');
+  assert.equal(input[1].path, skills[1].path);
+  const id = [...codex.threads.keys()][0];
+  codex.complete(id); await until(() => $('send-mode').hidden);
+  submit('/same choose one'); await until(() => /有多个来源/.test($('toast').textContent));
+  assert.equal($('prompt').value, '/same choose one');
+  assert.equal(codex.calls.filter(c => c.method === 'turn/start').length, 1);
+  $('prompt').value = '/same'; $('prompt').dispatchEvent(new window.Event('input'));
+  assert.equal($('suggestions').querySelectorAll('[data-skill]').length, 2);
+  $('suggestions').querySelectorAll('[data-skill]')[1].click();
+  await until(() => $('prompt').value === '$same ');
+  submit($('prompt').value + 'use source B');
+  await until(() => codex.calls.filter(c => c.method === 'turn/start').length === 2 && $('prompt').value === '');
+  assert.equal(withoutVisualizationGuide(codex.calls.filter(c => c.method === 'turn/start').at(-1).params.input)[1].path, skills[3].path);
+  assert.deepEqual(errors, []);
+});
+
+test('slash skill lookup prevents duplicate sends and cannot send into a conversation selected while loading', async t => {
+  const f = await fixture(t);
+  let release, hold = true, reads = 0;
+  const { codex, $, submit, errors } = await browserFixture(t, f, window => {
+    const fetch = window.fetch;
+    window.fetch = async (url, options) => {
+      if (url.startsWith('/api/skills')) {
+        reads++;
+        if (hold) await new Promise(resolve => { release = resolve; });
+      }
+      return fetch(url, options);
+    };
+  });
+  submit('/example first task'); await until(() => release);
+  assert.equal($('send').disabled, true);
+  submit('/example first task');
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(reads, 1);
+  hold = false; release();
+  await until(() => codex.calls.some(c => c.method === 'turn/start') && $('prompt').value === '' && !$('send').disabled);
+  const id = [...codex.threads.keys()][0];
+  codex.complete(id); await until(() => $('send-mode').hidden);
+  hold = true; release = null;
+  submit('/example keep this in the original conversation');
+  await until(() => release);
+  $('new-thread').click(); await until(() => codex.threads.size === 2 && !$('new-thread').disabled);
+  hold = false; release();
+  await until(() => !$('send').disabled);
+  assert.equal($('prompt').value, '');
+  assert.equal(codex.calls.filter(c => c.method === 'turn/start').length, 1);
+  $('thread-list').querySelector(`[data-thread="${id}"]`).click();
+  await until(() => $('prompt').value === '/example keep this in the original conversation');
+  assert.deepEqual(errors, []);
+});
+
+test('slash skill aliases keep structured skill input in steer and follow-up queue', async t => {
+  const { codex, $, submit, errors } = await browserFixture(t);
+  submit('start task'); await until(() => codex.calls.some(c => c.method === 'turn/start') && !$('send').disabled);
+  const id = [...codex.threads.keys()][0];
+  submit('/example guide the running task');
+  await until(() => $('prompt').value === '' && !$('send').disabled && $('steer-list').textContent.includes('$example guide the running task'));
+  codex.boundary(id);
+  await until(() => codex.calls.some(c => c.method === 'turn/steer'));
+  const steer = withoutVisualizationGuide(codex.calls.find(c => c.method === 'turn/steer').params.input);
+  assert.equal(steer[0].text, '$example guide the running task');
+  assert.equal(steer[1].type, 'skill');
+  $('send-mode').value = 'queue';
+  submit('/example next task');
+  await until(() => $('prompt').value === '' && !$('send').disabled && $('queue-list').textContent.includes('$example next task'));
+  codex.consumeSteers(id); codex.complete(id);
+  await until(() => codex.calls.filter(c => c.method === 'turn/start').length === 2);
+  const queued = withoutVisualizationGuide(codex.calls.filter(c => c.method === 'turn/start').at(-1).params.input);
+  assert.equal(queued[0].text, '$example next task');
+  assert.equal(queued[1].type, 'skill');
+  assert.deepEqual(errors, []);
+});
+
 test('browser can switch live threads, steer, choose skills and inspect children without HTML injection', async t => {
   const { codex, dir, window, $, submit, errors } = await browserFixture(t);
   $('new-thread').click(); await until(() => codex.threads.size === 1);
@@ -1197,6 +1775,7 @@ test('browser can switch live threads, steer, choose skills and inspect children
   await until(() => $('files-view').querySelector('[data-file-entry]'), 'project files in integrated panel');
   const topFilesTab = $('inspector-files-tab'); topFilesTab.focus();
   const key = name => window.document.activeElement.dispatchEvent(new window.KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true }));
+  key('ArrowRight'); assert.equal(window.document.activeElement, $('inspector-terminal-tab'));
   key('ArrowRight'); assert.equal(window.document.activeElement, $('inspector-agents-tab'));
   assert.equal($('files-view').hidden, false); assert.equal($('agents-view').hidden, true);
   key('Enter'); assert.equal($('files-view').hidden, true); assert.equal(window.document.activeElement, $('agents-view'));
@@ -1328,7 +1907,7 @@ test('BTW freezes multiple native forks when opened and generates only after sen
   const fork = codex.calls.find(c => c.method === 'thread/fork').params;
   assert.equal(fork.deferGoalContinuation, true);
   assert.equal(fork.sandbox, 'read-only');
-  assert.equal(fork.config.mcp_servers.codexweb_btw.enabled, true);
+  assert.equal(fork.config.mcp_servers.codexwui_btw.enabled, true);
   assert.equal(fork.config['features.goals'], false);
   await request(`/api/btw/${parent}/send`, { sessionId: first.id, text: 'First question' });
   assert.equal(codex.calls.filter(c => c.method === 'turn/start').at(-1).params.threadId, first.threadId);
@@ -1375,7 +1954,7 @@ test('BTW forks context, persists association, enforces isolated read-only tools
   assert.ok(start.developerInstructions.includes('主会话仍在继续'));
   assert.equal(start.config['features.multi_agent'], false);
   assert.equal(start.config.mcp_servers.dangerous.enabled, false);
-  assert.ok(start.config.mcp_servers.codexweb_btw.args.includes(project.path));
+  assert.ok(start.config.mcp_servers.codexwui_btw.args.includes(project.path));
   assert.equal((await request(`/api/btw/${parent}`)).body.session.threadId, side);
   assert.equal(JSON.parse(await readFile(path.join(dir, 'data/btw.json'), 'utf8'))[0].threadId, side);
   assert.ok(!(await request(`/api/threads?project=${project.id}`)).body.data.some(thread => thread.id === side));
@@ -1396,6 +1975,127 @@ test('BTW forks context, persists association, enforces isolated read-only tools
   assert.equal((await request(`/api/btw/${parent}/stop`, {})).status, 200);
   assert.ok(app.live.get(parent).activeTurnId);
   assert.equal(codex.calls.filter(c => c.method === 'turn/steer').length, 0);
+});
+
+test('BTW sends attachment-only messages and preserves attachments through steer edits and queue delivery', async t => {
+  const { request, project, codex, app } = await fixture(t);
+  const parent = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const record = (await request(`/api/btw/${parent}/open`, {})).body.session;
+  const image = (await request('/api/images', undefined, { method: 'POST', headers: { 'Content-Type': 'image/png' }, body: png })).body;
+  const file = (await request('/api/attachments', undefined, { method: 'POST', headers: { 'X-File-Name': 'notes.txt' }, body: 'Side attachment contents' })).body;
+  const input = { text: '', images: [image.id], files: [file.id] };
+  const control = (action, value) => request(`/api/btw/${parent}/${action}`, { sessionId: record.id, ...value });
+  for (const invalid of [{ ...input, files: null }, { ...input, images: null }, { ...input, files: Array(5).fill(file.id) }]) {
+    assert.equal((await control('send', invalid)).status, 400);
+  }
+  assert.equal(codex.calls.some(call => call.method === 'turn/start'), false);
+  assert.equal((await control('send', input)).status, 200);
+  const turn = codex.calls.filter(call => call.method === 'turn/start').at(-1).params;
+  assert.equal(turn.input[0].type, 'localImage');
+  assert.ok(turn.input[1].text.includes(file.id));
+  assert.deepEqual(turn.sandboxPolicy, { type: 'readOnly' });
+  const side = turn.threadId;
+  const read = await codex.dynamicToolHandler({ threadId: side, tool: 'btw_read_file', arguments: { path: app.btw.attachments.location(file.id) } });
+  assert.match(read.contentItems[0].text, /Side attachment contents/);
+  const staged = await control('steer', { ...input, expectedTurnId: app.live.get(side).activeTurnId });
+  assert.equal(staged.status, 200);
+  let entry = staged.body.steers.entries[0];
+  entry = (await control('steer-edit', { id: entry.id, revision: entry.revision })).body.entry;
+  assert.equal((await control('steer-update', { id: entry.id, revision: entry.revision, text: 'Edited attachment question' })).status, 200);
+  entry = app.btw.steers.snapshot(side).entries[0];
+  assert.deepEqual(entry.images, [image.id]); assert.deepEqual(entry.files, [file.id]);
+  assert.equal((await control('steer-send', { id: entry.id, revision: entry.revision })).status, 200);
+  const delivered = codex.calls.filter(call => call.method === 'turn/steer').at(-1).params;
+  assert.equal(delivered.threadId, side);
+  assert.deepEqual(delivered.input.slice(1), turn.input);
+  assert.equal((await control('queue', input)).status, 200);
+  codex.complete(side);
+  await until(() => codex.threads.get(side).turns.length === 2);
+  const queued = codex.calls.filter(call => call.method === 'turn/start').at(-1).params;
+  assert.deepEqual(queued.input, turn.input);
+  assert.deepEqual(queued.sandboxPolicy, { type: 'readOnly' });
+});
+
+test('BTW browser supports file and image controls like the main composer', async t => {
+  const { window, $, submit, codex, errors } = await browserFixture(t);
+  $('new-thread').click(); await until(() => codex.threads.size === 1);
+  submit('/btw'); await until(() => $('btw-select').options.length === 1 && !$('btw-prompt').disabled);
+  assert.ok($('btw-image-input'), 'BTW needs an image picker');
+  assert.ok($('btw-file-input'), 'BTW needs a file picker');
+  for (const [id, file] of [
+    ['btw-image-input', new File([png], 'side.png', { type: 'image/png' })],
+    ['btw-file-input', new File(['Side notes'], 'side.txt', { type: 'text/plain' })],
+  ]) {
+    Object.defineProperty($(id), 'files', { configurable: true, value: [file] });
+    $(id).dispatchEvent(new window.Event('change'));
+  }
+  await until(() => $('btw-attachments').textContent.includes('side.txt') && $('btw-attachments').querySelector('img') && !$('btw-send').disabled);
+  assert.equal($('image-attachments').hidden, true, 'main draft must stay separate');
+  $('btw-prompt').dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }));
+  await until(() => codex.calls.some(call => call.method === 'turn/start') && $('btw-attachments').hidden);
+  await until(() => $('btw-messages').querySelector('.message-image') && $('btw-messages').textContent.includes('side.txt'));
+  for (const id of ['btw-image-input', 'btw-file-input']) $(id).dispatchEvent(new window.Event('change'));
+  await until(() => $('btw-attachments').querySelector('img') && $('btw-attachments').textContent.includes('side.txt') && !$('btw-send').disabled);
+  $('btw-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => $('btw-pending').querySelector('img') && $('btw-attachments').hidden);
+  $('btw-pending').querySelector('[data-btw-steer="edit"]').click();
+  await until(() => !$('btw-steer-form').hidden);
+  assert.ok($('btw-steer-attachments').querySelector('img'));
+  $('btw-steer-attachments').querySelector('[data-btw-edit-attachment="files"]').click();
+  $('btw-steer-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => $('btw-steer-form').hidden && !$('btw-pending').textContent.includes('side.txt'));
+  assert.ok($('btw-pending').querySelector('img'), 'editing must preserve the remaining image');
+  assert.deepEqual(errors, []);
+});
+
+test('BTW attachment uploads, failures, paste and drop stay with their original side draft', async t => {
+  const { window, $, submit, codex, errors } = await browserFixture(t);
+  $('new-thread').click(); await until(() => codex.threads.size === 1);
+  submit('/btw'); await until(() => $('btw-select').options.length === 1 && !$('btw-prompt').disabled);
+  const first = $('btw-select').value, originalFetch = window.fetch;
+  let release;
+  window.fetch = async (url, options) => {
+    if (url === '/api/images') await new Promise(resolve => { release = resolve; });
+    return originalFetch(url, options);
+  };
+  const paste = new window.Event('paste', { bubbles: true, cancelable: true });
+  Object.defineProperty(paste, 'clipboardData', { value: { files: [new File([png], 'pasted.png', { type: 'image/png' })] } });
+  $('btw-prompt').dispatchEvent(paste);
+  await until(() => release);
+  assert.equal(paste.defaultPrevented, true); assert.equal($('btw-send').disabled, true);
+  $('btw-new').click(); await until(() => $('btw-select').options.length === 2 && !$('btw-prompt').disabled);
+  assert.equal($('btw-attachments').hidden, true);
+  release(); window.fetch = originalFetch;
+  const select = async id => {
+    $('btw-select').value = id; $('btw-select').dispatchEvent(new window.Event('change'));
+    await until(() => $('btw-select').value === id && !$('btw-prompt').disabled);
+  };
+  await select(first);
+  await until(() => $('btw-attachments').querySelector('img') && !$('btw-send').disabled);
+  const drop = new window.Event('drop', { bubbles: true, cancelable: true });
+  Object.defineProperty(drop, 'dataTransfer', { value: { files: [new File(['dropped notes'], 'dropped.txt', { type: 'text/plain' })] } });
+  $('btw-form').dispatchEvent(drop);
+  assert.equal(drop.defaultPrevented, true);
+  await until(() => $('btw-attachments').textContent.includes('dropped.txt') && !$('btw-send').disabled);
+  window.fetch = (url, options) => String(url).endsWith('/send') ? Promise.resolve(new Response(JSON.stringify({ error: 'Side send failed' }), { status: 503 })) : originalFetch(url, options);
+  $('btw-prompt').value = 'Keep question'; $('btw-prompt').dispatchEvent(new window.Event('input'));
+  $('btw-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => $('btw-error').textContent.includes('Side send failed') && !$('btw-prompt').disabled);
+  assert.equal($('btw-prompt').value, 'Keep question');
+  assert.equal($('btw-attachments').querySelectorAll('[data-btw-remove-attachment]').length, 2);
+  window.fetch = (url, options) => url === '/api/images' ? Promise.resolve(new Response(JSON.stringify({ error: 'Side upload failed' }), { status: 500 })) : originalFetch(url, options);
+  $('btw-prompt').dispatchEvent(paste);
+  await until(() => $('btw-attachments').textContent.includes('Side upload failed'));
+  assert.equal($('btw-send').disabled, true);
+  [...$('btw-attachments').querySelectorAll('[data-btw-remove-attachment]')].at(-1).click();
+  await until(() => !$('btw-send').disabled);
+  window.fetch = originalFetch;
+  $('btw-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => $('btw-attachments').hidden && codex.calls.some(call => call.method === 'turn/start'));
+  const input = codex.calls.filter(call => call.method === 'turn/start').at(-1).params.input;
+  assert.equal(input[1].type, 'localImage'); assert.match(input[2].text, /dropped.txt/);
+  assert.equal($('image-attachments').hidden, true);
+  assert.deepEqual(errors, []);
 });
 
 test('BTW browser command streams in side panel and brings an answer back as a draft only', async t => {
@@ -1545,6 +2245,7 @@ test('BTW preserves streamed text and completion arriving before the send respon
   release = null;
   $('btw-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
   await until(() => release);
+  await until(() => !$('btw-stop').hidden);
   codex.complete(side.id);
   await until(() => $('btw-stop').hidden);
   release(); await until(() => !$('btw-prompt').disabled);
@@ -1759,6 +2460,9 @@ test('browser reload saves main and BTW drafts and can be requested while discon
   submit('/btw'); await until(() => $('btw-select').options.length === 1 && !$('btw-prompt').disabled);
   const sideId = $('btw-select').value;
   $('btw-prompt').value = 'Keep side draft'; $('btw-prompt').dispatchEvent(new window.Event('input'));
+  Object.defineProperty($('btw-image-input'), 'files', { configurable: true, value: [new File([png], 'saved-side.png', { type: 'image/png' })] });
+  $('btw-image-input').dispatchEvent(new window.Event('change'));
+  await until(() => $('btw-attachments').querySelector('img') && !$('btw-send').disabled);
   codex.fail(new Error('Disconnected'));
   await until(() => $('connection-label').textContent !== 'Codex 已连接');
   const original = window.fetch;
@@ -1774,6 +2478,9 @@ test('browser reload saves main and BTW drafts and can be requested while discon
   assert.equal(new Map(saved.drafts).get(id).text, '');
   assert.equal(new Map(saved.btw).get(sideId), 'Keep side draft');
   assert.equal(new Map(saved.btwSelected).get(id), sideId);
+  const attachments = new Map(saved.btwAttachments).get(sideId);
+  assert.equal(attachments[0].name, 'saved-side.png');
+  assert.ok(attachments[0].id);
   assert.equal(codex.calls.filter(call => call.method === 'turn/start').length, 0);
   assert.deepEqual(errors, []);
 });
@@ -1850,4 +2557,317 @@ test('thread switching still hydrates history when an older service cannot serve
   await until(() => $('messages').textContent.includes('target thread history'), 'switched thread history');
   assert.ok(historyRequests.length, 'switch must start loading history immediately');
   assert.equal(errors.some(message => /reading ['"]html|property ['"]html/.test(message)), false, errors.join('\n'));
+});
+
+test('authority updates future turns only, validates modes, restores local defaults and survives reload', async t => {
+  const f = await fixture(t), { request, project, codex, app, dir } = f;
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const other = (await request('/api/threads', { project: project.id })).body.thread.id;
+  await request(`/api/threads/${id}/send`, { text: 'running task' });
+  const before = structuredClone(codex.calls.find(c => c.method === 'turn/start'));
+  const save = await request(`/api/threads/${id}/model`, { model: 'test-fast', effort: 'medium', authority: 'read-only' });
+  assert.equal(save.status, 200); assert.equal(save.body.appliesTo, 'nextTurn');
+  assert.equal(save.body.authority, 'read-only');
+  assert.equal(codex.threads.get(id).permissions, ':read-only');
+  assert.deepEqual(codex.calls.find(c => c.method === 'turn/start'), before);
+  assert.equal((await request(`/api/threads/${other}`)).body.authority, 'default');
+  assert.equal((await request(`/api/threads/${id}/model`, { model: 'test-fast', authority: 'invented' })).status, 400);
+  assert.equal((await request(`/api/threads/${id}`)).body.authority, 'read-only');
+  assert.equal((await request(`/api/threads/${id}`)).body.pendingAuthority, true);
+  const originalRequest = codex.request.bind(codex);
+  codex.request = async (method, params) => {
+    if (method === 'thread/settings/update' && params.permissions === ':danger-full-access') throw new Error('权限受本机要求限制');
+    return originalRequest(method, params);
+  };
+  assert.equal((await request(`/api/threads/${id}/model`, { model: 'test-fast', authority: 'full' })).status, 500);
+  assert.equal((await request(`/api/threads/${id}`)).body.authority, 'read-only');
+  codex.complete(id); await app.close();
+  const restored = await createApp({ codex, dataDir: path.join(dir, 'data'), initialProject: dir });
+  t.after(() => restored.close());
+  restored.server.listen(0, '127.0.0.1'); await once(restored.server, 'listening'); await restored.startup;
+  const url = `http://127.0.0.1:${restored.server.address().port}/api/threads/${id}`;
+  assert.equal((await (await fetch(url)).json()).authority, 'read-only');
+  const post = data => fetch(url + '/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  const reset = await post({ model: 'test-fast', effort: 'medium', authority: 'default' });
+  assert.equal(reset.status, 200);
+  assert.equal((await reset.json()).authority, 'default');
+  const updates = codex.calls.filter(c => c.method === 'thread/settings/update');
+  assert.ok(updates.some(c => c.params.permissions === ':read-only'), 'saved choice is reapplied on resume');
+  assert.equal(updates.at(-1).params.approvalPolicy, 'on-request');
+  assert.equal(updates.at(-1).params.sandboxPolicy.type, 'workspaceWrite');
+  await restored.close();
+});
+
+test('context entry separates snapshot occupancy from cumulative usage, compacts and restores after reconnect', async t => {
+  const f = await browserFixture(t), { $, window, submit, codex, request, errors } = f;
+  submit('usage task'); await until(() => codex.calls.some(c => c.method === 'turn/start'));
+  const id = [...codex.threads.keys()][0], turnId = codex.threads.get(id).turns[0].id;
+  await until(() => !$('context-strip').hidden);
+  assert.equal($('context-label').textContent, '上下文 —');
+  const counts = totalTokens => ({ totalTokens, inputTokens: totalTokens - 1000, cachedInputTokens: 1000, outputTokens: 1000, reasoningOutputTokens: 400 });
+  const report = (used, total) => codex.event('thread/tokenUsage/updated', { threadId: id, turnId, tokenUsage: { last: counts(used), total: counts(total), modelContextWindow: 100000 } });
+  report(85000, 500000);
+  await until(() => $('context-label').textContent === '上下文已用 85%');
+  assert.equal($('context-strip').classList.contains('high'), true);
+  $('context-usage').click(); assert.equal($('usage-dialog').open, true);
+  assert.equal($('usage-total').textContent, '500k');
+  assert.equal($('usage-compact').disabled, true, 'running tasks cannot compact manually');
+  codex.complete(id); await until(() => !$('usage-compact').disabled);
+  $('usage-compact').click(); await until(() => codex.calls.some(c => c.method === 'thread/compact/start'));
+  codex.event('item/started', { threadId: id, turnId, item: { id: 'compact-1', type: 'contextCompaction' } });
+  await until(() => $('context-label').textContent === '正在压缩…');
+  report(20000, 520000);
+  codex.event('item/completed', { threadId: id, turnId, item: { id: 'compact-1', type: 'contextCompaction' } });
+  await until(() => $('context-label').textContent === '上下文已用 20%');
+  assert.equal($('usage-total').textContent, '520k');
+  assert.match($('context-status').textContent, /85% → 20%/);
+  const other = (await request('/api/threads', { project: f.project.id })).body.thread.id;
+  codex.event('thread/tokenUsage/updated', { threadId: other, turnId: 'other-turn', tokenUsage: { last: counts(90000), total: counts(90000), modelContextWindow: 100000 } });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal($('context-label').textContent, '上下文已用 20%');
+  const reconnect = await browserFixture(t, f);
+  await until(() => reconnect.window.document.querySelector(`[data-thread="${id}"]`));
+  reconnect.window.document.querySelector(`[data-thread="${id}"]`).click();
+  await until(() => reconnect.$('context-label').textContent === '上下文已用 20%');
+  assert.equal($('composer-hint'), null);
+  assert.match($('model-label').textContent, /test-fast \/ medium \/ 默认/);
+  $('close-usage-dialog').click(); $('model-label').click();
+  await until(() => $('model-dialog').open);
+  $('authority-select').value = 'workspace'; $('authority-select').dispatchEvent(new window.Event('change'));
+  $('model-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => !$('model-dialog').open && $('model-label').textContent.includes('工作区'));
+  assert.equal((await request(`/api/threads/${id}`)).body.authority, 'workspace');
+  assert.deepEqual(errors, []); assert.deepEqual(reconnect.errors, []);
+});
+
+test('config initial authority picker updates only subsequently created conversations', async t => {
+  const { $, window, submit, codex, errors } = await browserFixture(t);
+  submit('existing'); await until(() => codex.calls.some(c => c.method === 'turn/start'));
+  const old = [...codex.threads.keys()][0]; codex.complete(old);
+  submit('/config'); await until(() => $('config-dialog').open && !$('config-form').querySelector('[data-config-save]').disabled);
+  $('config-defaultAuthority').value = 'read-only'; $('config-defaultAuthority').dispatchEvent(new window.Event('change'));
+  $('config-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => $('config-form').querySelector('[data-config-status]').textContent.startsWith('已保存'));
+  assert.match($('model-label').textContent, /默认/);
+  $('config-dialog').close(); $('new-thread').click();
+  await until(() => codex.threads.size === 2 && $('model-label').textContent.includes('只读'));
+  assert.equal(codex.calls.filter(c => c.method === 'thread/start').at(-1).params.permissions, ':read-only');
+  assert.deepEqual(errors, []);
+});
+
+test('failed turns recover the persisted original attachments and skills exactly once, while successors stay paused', async t => {
+  const { app, request, project, codex, base } = await fixture(t);
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const image = await (await fetch(base + '/api/images', { method: 'POST', headers: { 'Content-Type': 'image/png' }, body: png })).json();
+  const file = await (await fetch(base + '/api/attachments', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': 'notes.txt' }, body: 'notes' })).json();
+  const payload = { text: 'Use my notes', images: [image.id], files: [file.id], skills: [{ name: 'example', path: codex.cwd + '/SKILL.md' }], clientUserMessageId: 'original-request' };
+  const sent = await request(`/api/threads/${id}/send`, payload);
+  assert.equal(sent.status, 200);
+  const original = codex.calls.find(call => call.method === 'turn/start').params.input;
+  await request(`/api/threads/${id}/queue`, { text: 'wait for recovery' });
+  codex.threads.get(id).turns.at(-1).error = { message: 'unexpected status 403 Forbidden: <html>blocked</html>', codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 403 } } };
+  codex.complete(id, 'failed');
+  await until(() => !app.lifecycle.cleaning.has(id));
+  const snapshot = (await request(`/api/threads/${id}`)).body;
+  assert.equal(snapshot.history.data[0].failure.category, 'access');
+  assert.equal(snapshot.history.data[0].recoveryMode, 'retry');
+  const saved = JSON.parse(await readFile(path.join(app.recovery.file.file), 'utf8'));
+  assert.equal(saved[0][1].input.files[0], file.id);
+  const action = { action: 'retry', turnId: sent.body.turn.id, actionId: 'retry-once' };
+  const results = await Promise.all([request(`/api/threads/${id}/recover`, action), request(`/api/threads/${id}/recover`, action)]);
+  assert.deepEqual(results.map(result => result.status), [200, 200]);
+  assert.equal(codex.calls.filter(call => call.method === 'turn/start').length, 2);
+  assert.deepEqual(codex.calls.filter(call => call.method === 'turn/start').at(-1).params.input, original);
+  codex.complete(id);
+  assert.equal(app.queue.snapshot(id).entries[0].status, 'unsent');
+  assert.equal((await request(`/api/threads/${id}/send`, payload)).body.turn.id, sent.body.turn.id);
+  assert.equal((await request(`/api/threads/${id}/send`, { ...payload, text: 'different' })).status, 409);
+});
+
+test('partial execution offers continuation, preserves the original objective and supports explicit model switching', async t => {
+  const { app, request, project, codex } = await fixture(t);
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const sent = await request(`/api/threads/${id}/send`, { text: 'Update the project', clientUserMessageId: 'partial-original' });
+  codex.threads.get(id).turns.at(-1).items.push({ id: 'tool', type: 'commandExecution', command: 'write result', status: 'completed' });
+  codex.complete(id, 'failed');
+  await until(() => !app.lifecycle.cleaning.has(id));
+  const target = { turnId: sent.body.turn.id, actionId: 'continue-once' };
+  assert.equal((await request(`/api/threads/${id}/recover`, { ...target, action: 'retry' })).status, 409);
+  assert.equal((await request(`/api/threads/${id}/recover`, { ...target, action: 'continue', model: 'test-deep', effort: 'high' })).status, 200);
+  const last = codex.calls.filter(call => call.method === 'turn/start').at(-1).params;
+  assert.equal(last.model, 'test-deep'); assert.equal(last.effort, 'high');
+  assert.match(last.input[0].text, /先核对历史中的工具执行结果/);
+  assert.equal(app.recovery.records.get('continue-once').input.text, 'Update the project');
+});
+
+test('lost acknowledgement is reconciled by client identity instead of blindly resending', async t => {
+  const { app, request, project, codex } = await fixture(t);
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const native = codex.request.bind(codex);
+  codex.request = async (method, params) => {
+    const result = await native(method, params);
+    if (method === 'turn/start') throw Object.assign(new Error('response lost'), { rpcTimeout: true });
+    return result;
+  };
+  const payload = { text: 'Only once', clientUserMessageId: 'uncertain-request' };
+  const failed = await request(`/api/threads/${id}/send`, payload);
+  assert.equal(failed.body.deliveryUnknown, true);
+  assert.equal((await request(`/api/threads/${id}/send`, payload)).status, 409);
+  assert.equal(codex.calls.filter(call => call.method === 'turn/start').length, 1);
+  const checked = await request(`/api/threads/${id}/recover`, { action: 'check' });
+  assert.equal(checked.body.recovery[0].state, 'running');
+  assert.equal(checked.body.recovery[0].turnId, codex.threads.get(id).turns[0].id);
+  assert.equal((await request(`/api/threads/${id}/send`, payload)).status, 200);
+  assert.equal(codex.calls.filter(call => call.method === 'turn/start').length, 1);
+  assert.equal(app.recovery.records.get('uncertain-request').state, 'running');
+});
+
+test('turn counting spans all pages and native fork boundaries preserve inherited history with the requested title', async t => {
+  const { request, project, codex } = await fixture(t);
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const source = codex.threads.get(id); source.name = 'Original';
+  source.turns = Array.from({ length: 125 }, (_, i) => ({ id: `number-${i + 1}`, status: 'completed', items: [{ id: `user-${i}`, type: 'userMessage', content: [{ type: 'text', text: `Q${i}` }] }] }));
+  source.turns[9].items.push({ id: 'compaction', type: 'contextCompaction' });
+  assert.equal((await request(`/api/threads/${id}/turn-count`)).body.count, 125);
+  const input = { turnId: 'number-11', actionId: 'fork-eleven' };
+  const forks = await Promise.all([request(`/api/threads/${id}/fork`, input), request(`/api/threads/${id}/fork`, input)]);
+  assert.deepEqual(forks.map(result => result.status), [200, 200]);
+  assert.equal(forks[0].body.thread.id, forks[1].body.thread.id);
+  const fork = forks[0].body.thread;
+  assert.equal(fork.name, 'fork Original');
+  assert.equal((await request(`/api/threads/${fork.id}/turn-count`)).body.count, 11);
+  assert.deepEqual(codex.threads.get(fork.id).turns, source.turns.slice(0, 11));
+  assert.equal(codex.calls.filter(call => call.method === 'thread/fork').length, 1);
+  assert.equal(source.turns.length, 125);
+  source.turns.at(-1).status = 'inProgress';
+  assert.equal((await request(`/api/threads/${id}/fork`, { turnId: 'number-125', actionId: 'unfinished' })).status, 409);
+  const before = await request(`/api/threads/${id}/fork`, { turnId: 'number-11', before: true, actionId: 'fork-before' });
+  assert.equal(before.body.thread.turns.length, 10);
+});
+
+test('stop cancels a recovery that is waiting for failed-turn cleanup', async t => {
+  const { app, request, project, codex } = await fixture(t);
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const sent = await request(`/api/threads/${id}/send`, { text: 'work' });
+  const native = codex.request.bind(codex); let release;
+  codex.request = async (method, params) => {
+    if (method === 'thread/backgroundTerminals/clean') await new Promise(resolve => { release = resolve; });
+    return native(method, params);
+  };
+  codex.complete(id, 'failed'); await until(() => release);
+  const recovering = request(`/api/threads/${id}/recover`, { action: 'retry', turnId: sent.body.turn.id, actionId: 'cancelled-recovery' });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const stopping = request(`/api/threads/${id}/stop`, {});
+  await new Promise(resolve => setTimeout(resolve, 50)); release();
+  assert.equal((await stopping).status, 200);
+  assert.equal((await recovering).status, 409);
+  assert.equal(codex.calls.filter(call => call.method === 'turn/start').length, 1);
+});
+
+test('browser shows the count beside 会话, folds raw errors, displays native retries and forks at a turn footer', async t => {
+  const { window, $, submit, codex, errors, app } = await browserFixture(t);
+  submit('Original question');
+  await until(() => codex.calls.some(call => call.method === 'turn/start'));
+  const id = [...codex.threads.keys()][0], first = codex.threads.get(id).turns[0];
+  await until(() => $('turn-count').textContent === ' · 第 1 轮');
+  assert.equal($('turn-count').parentElement.className, 'conversation-label');
+  codex.event('error', { threadId: id, turnId: first.id, willRetry: true, error: { message: 'upstream retry' } });
+  await until(() => $('messages').querySelector('.turn-retrying'));
+  assert.equal($('messages').querySelector('[data-turn-action="retry"]'), null);
+  first.error = { message: 'unexpected status 403 Forbidden: <html>raw-error-body</html>' };
+  codex.complete(id, 'failed');
+  await until(() => $('messages').querySelector('[data-turn-action="retry"]'));
+  const card = $('messages').querySelector('.turn-failure');
+  assert.match(card.querySelector('p').textContent, /403/);
+  assert.match(card.querySelector('details pre').textContent, /<html>raw-error-body/);
+  assert.equal(card.querySelector('details').open, false);
+  assert.equal(card.querySelector('html'), null);
+  await until(() => !app.lifecycle.cleaning.has(id));
+  $('messages').querySelector('[data-turn-action="model"]').click();
+  await until(() => $('model-dialog').open);
+  $('model-select').value = 'test-deep'; $('model-select').dispatchEvent(new window.Event('change'));
+  $('reasoning-select').value = 'high';
+  $('model-form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => codex.calls.filter(call => call.method === 'turn/start').length === 2);
+  await until(() => !$('model-dialog').open);
+  assert.equal(codex.calls.filter(call => call.method === 'turn/start').at(-1).params.model, 'test-deep');
+  codex.complete(id);
+  await until(() => $('turn-count').textContent === ' · 第 2 轮');
+  await until(() => $('messages').querySelectorAll('[data-turn-action="fork"]').length === 2);
+  const button = $('messages').querySelector('[data-turn-action="fork"]');
+  assert.ok(button.closest('.turn-footer'));
+  button.click();
+  await until(() => $('thread-title').textContent.startsWith('fork '));
+  await until(() => $('turn-count').textContent === ' · 第 1 轮');
+  assert.equal(codex.calls.filter(call => call.method === 'thread/fork').at(-1).params.lastTurnId, first.id);
+  assert.equal(codex.calls.filter(call => call.method === 'turn/start').length, 2, 'fork does not generate');
+  assert.deepEqual(errors, []);
+});
+
+test('legacy failed messages restore original text and attachments, and older failures must fork before editing', async t => {
+  const { request, project, codex } = await fixture(t);
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  codex.threads.get(id).turns = [{ id: 'legacy-failed', status: 'failed', error: { message: 'HTTP 403' }, items: [
+    { id: 'legacy-input', type: 'userMessage', content: [{ type: 'text', text: 'Original legacy question' }, { type: 'text', text: '[CodexWUI visualization instructions]\ninternal guide' }] },
+  ] }, { id: 'newer', status: 'completed', items: [{ id: 'newer-input', type: 'userMessage', content: [{ type: 'text', text: 'Newer message' }] }] }];
+  const edit = await request(`/api/threads/${id}/recover`, { action: 'edit', turnId: 'legacy-failed' });
+  assert.equal(edit.status, 200); assert.equal(edit.body.latest, false);
+  assert.equal(edit.body.input.text, 'Original legacy question');
+  assert.equal((await request(`/api/threads/${id}/recover`, { action: 'retry', turnId: 'legacy-failed', actionId: 'stale' })).status, 409);
+  const fork = await request(`/api/threads/${id}/fork`, { turnId: 'legacy-failed', before: true, actionId: 'edit-old' });
+  assert.equal(fork.status, 200); assert.equal(fork.body.thread.turns.length, 0);
+});
+
+test('a fresh browser restores failed-message editing with attachment chips and does not overwrite another draft', async t => {
+  const f = await fixture(t), { request, project, codex, base, app } = f;
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const image = await (await fetch(base + '/api/images', { method: 'POST', headers: { 'Content-Type': 'image/png' }, body: png })).json();
+  await request(`/api/threads/${id}/send`, { text: 'Saved question', images: [image.id], clientUserMessageId: 'saved-question' });
+  codex.complete(id, 'failed'); await until(() => !app.lifecycle.cleaning.has(id));
+  const { $, window, errors } = await browserFixture(t, f);
+  await until(() => window.document.querySelector(`[data-thread="${id}"]`));
+  window.document.querySelector(`[data-thread="${id}"]`).click();
+  await until(() => $('messages').querySelector('[data-turn-action="edit"]'));
+  $('prompt').value = 'My new draft'; $('prompt').dispatchEvent(new window.Event('input'));
+  $('messages').querySelector('[data-turn-action="edit"]').click();
+  await until(() => $('toast').textContent.includes('请先处理输入框中的草稿'));
+  assert.equal($('prompt').value, 'My new draft');
+  $('prompt').value = ''; $('prompt').dispatchEvent(new window.Event('input'));
+  $('messages').querySelector('[data-turn-action="edit"]').click();
+  await until(() => $('prompt').value === 'Saved question');
+  assert.ok($('image-attachments').querySelector(`img[src="/api/images/${image.id}"]`));
+  assert.deepEqual(errors, []);
+});
+
+test('an uncertain recovery cannot be bypassed by clicking retry with a new action ID', async t => {
+  const { request, project, codex, app } = await fixture(t);
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const sent = await request(`/api/threads/${id}/send`, { text: 'work' });
+  codex.complete(id, 'failed'); await until(() => !app.lifecycle.cleaning.has(id));
+  const native = codex.request.bind(codex);
+  codex.request = async (method, params) => {
+    if (method === 'turn/start') throw Object.assign(new Error('transport lost'), { rpcTimeout: true });
+    return native(method, params);
+  };
+  const first = await request(`/api/threads/${id}/recover`, { action: 'retry', turnId: sent.body.turn.id, actionId: 'uncertain-retry' });
+  assert.equal(first.body.deliveryUnknown, true);
+  const second = await request(`/api/threads/${id}/recover`, { action: 'retry', turnId: sent.body.turn.id, actionId: 'another-retry' });
+  assert.equal(second.status, 409); assert.match(second.body.error, /发送结果待确认/);
+});
+
+test('retrying fork setup after a naming failure completes the same fork without creating another', async t => {
+  const { request, project, codex } = await fixture(t);
+  const id = (await request('/api/threads', { project: project.id })).body.thread.id;
+  const sent = await request(`/api/threads/${id}/send`, { text: 'source' }); codex.complete(id);
+  const native = codex.request.bind(codex); let failName = true;
+  codex.request = async (method, params) => {
+    if (method === 'thread/name/set' && failName) { failName = false; throw Object.assign(new Error('name temporarily unavailable'), { rpcRejected: true }); }
+    return native(method, params);
+  };
+  const action = { turnId: sent.body.turn.id, actionId: 'fork-with-name' };
+  const failed = await request(`/api/threads/${id}/fork`, action);
+  assert.equal(failed.status, 500); assert.equal(failed.body.retrySameOperation, true);
+  const retried = await request(`/api/threads/${id}/fork`, action);
+  assert.equal(retried.status, 200); assert.match(retried.body.thread.name, /^fork /);
+  assert.equal(codex.calls.filter(call => call.method === 'thread/fork').length, 1);
 });

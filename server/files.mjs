@@ -1,9 +1,12 @@
-import { realpath, open, opendir, stat } from 'node:fs/promises';
+import { realpath, open, opendir, stat, link, copyFile, unlink } from 'node:fs/promises';
 import { constants } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { CARD_PREFIX, isStudyCardHTML } from './studycard-html.mjs';
 
 export const TEXT_LIMIT = 1024 * 1024;
 const DIRECTORY_LIMIT = 5000;
+const activeUploads = new Set();
 const failure = (status, message) => Object.assign(new Error(message), { status });
 function inside(root, target) {
   const relative = path.relative(root, target);
@@ -18,6 +21,7 @@ function readableError(error) {
   if (error.code === 'ENOENT') return failure(404, '文件或目录已不存在，请刷新目录');
   if (['EACCES', 'EPERM'].includes(error.code)) return failure(403, '没有读取这个文件或目录的权限');
   if (['ELOOP', 'ENOTDIR'].includes(error.code)) return failure(400, '路径已改变或符号链接无效，请刷新目录');
+  if (['ENOSPC', 'EDQUOT'].includes(error.code)) return failure(507, '存储空间不足，无法上传文件');
   return failure(500, '无法读取文件或目录');
 }
 async function resolve(root, relative) {
@@ -50,6 +54,7 @@ export async function listDirectory(root, relative = '') {
     const entries = [];
     let truncated = false;
     for await (const entry of directory) {
+      if (activeUploads.has(entry.name)) continue;
       if (entries.length >= DIRECTORY_LIMIT) { truncated = true; break; }
       const item = { name: entry.name, path: path.posix.join(opened.relative, entry.name),
         type: entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : 'other', symlink: entry.isSymbolicLink() };
@@ -67,6 +72,74 @@ export async function listDirectory(root, relative = '') {
     return { path: opened.relative, entries, truncated, limit: DIRECTORY_LIMIT };
   } catch (error) { throw readableError(error); }
   finally { await opened?.handle.close(); }
+}
+
+function uploadName(header) {
+  let name;
+  try { name = decodeURIComponent(header || ''); } catch { throw failure(400, '文件名无效'); }
+  if (!name || name === '.' || name === '..' || /[/\\\x00-\x1f\x7f]/u.test(name) || Buffer.byteLength(name) > 255) throw failure(400, '文件名无效');
+  return name;
+}
+function collisionName(name, number) {
+  if (!number) return name;
+  // Reserve suffix space without splitting a Unicode character or losing a normal extension.
+  const extension = Buffer.byteLength(path.extname(name)) <= 80 ? path.extname(name) : '';
+  const suffix = ` (${number})${extension}`;
+  const stem = [...name.slice(0, extension ? -extension.length : undefined)];
+  while (Buffer.byteLength(stem.join('') + suffix) > 255) stem.pop();
+  return stem.join('') + suffix;
+}
+
+export async function uploadProjectFile(root, relative, req, maxBytes) {
+  let directory, file, partial, temporary, owned = false, complete = false;
+  try {
+    const name = uploadName(req.headers['x-file-name']);
+    const tooLarge = () => failure(413, `单个文件不能超过 ${maxBytes / (1024 * 1024)} MiB`);
+    if (Number(req.headers['content-length']) > maxBytes) throw tooLarge();
+    directory = await openInside(root, relative, true);
+    const descriptor = `/proc/self/fd/${directory.handle.fd}`;
+    temporary = `.codexwui-upload-${randomUUID()}.part`;
+    partial = path.join(descriptor, temporary);
+    file = await open(partial, 'wx', 0o600); owned = true; activeUploads.add(temporary);
+    let size = 0;
+    // Keep the socket usable for a 413 response even when Content-Length was omitted.
+    for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+      size += chunk.length;
+      if (size > maxBytes) throw tooLarge();
+      await file.writeFile(chunk);
+    }
+    const info = await file.stat();
+    await file.close(); file = null;
+    // Pin writes to the opened directory and reject a target moved/replaced during upload.
+    const current = await resolve(root, relative);
+    if (current.target !== directory.target || await realpath(descriptor) !== directory.target) throw failure(409, '上传目录已改变，请刷新后重试');
+    let copy = false;
+    for (let number = 0; number < 1000; number++) {
+      const finalName = collisionName(name, number), destination = path.join(descriptor, finalName);
+      try {
+        if (!copy) {
+          try { await link(partial, destination); }
+          catch (error) {
+            // Android shared storage can reject hard links. Exclusive copy still
+            // preserves existing files, including dangling symlinks and directories.
+            if (!['EACCES', 'EPERM', 'EOPNOTSUPP', 'ENOTSUP', 'EXDEV', 'ENOSYS'].includes(error.code)) throw error;
+            copy = true;
+          }
+        }
+        if (copy) await copyFile(partial, destination, constants.COPYFILE_EXCL);
+        complete = true;
+        return { name: finalName, path: path.posix.join(directory.relative, finalName), size, modifiedAt: info.mtime.toISOString(), renamed: finalName !== name };
+      } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    }
+    throw failure(409, '同名文件过多，请修改文件名后重试');
+  } catch (error) { throw readableError(error); }
+  finally {
+    await file?.close().catch(() => {});
+    if (owned) await unlink(partial).catch(() => {});
+    activeUploads.delete(temporary);
+    await directory?.handle.close();
+    if (!complete) req.resume();
+  }
 }
 
 export async function readTextFile(root, relative) {
@@ -128,10 +201,32 @@ export async function openFileContent(root, input) {
 
 export async function readFilePreview(root, input) {
   const file = await openFileContent(root, input);
-  await file.handle.close();
   const metadata = { path: file.relative, size: file.size, modifiedAt: file.modifiedAt, kind: file.kind };
+  let studycard = false;
+  try {
+    if (file.relative.startsWith('StudyCard/') && /\.html$/i.test(file.relative)) {
+      const buffer = Buffer.alloc(Buffer.byteLength(CARD_PREFIX));
+      await file.handle.read(buffer, 0, buffer.length, 0);
+      studycard = isStudyCardHTML(buffer.toString('utf8'));
+    }
+  } finally { await file.handle.close(); }
   if (file.kind !== 'text') return metadata;
   const result = await readTextFile(root, file.relative);
   if (result.kind === 'text' && /\.(md|markdown)$/i.test(file.relative)) result.kind = 'markdown';
+  if (result.kind === 'text' && /\.html?$/i.test(file.relative)) result.kind = studycard ? 'studycard' : 'html';
   return result;
+}
+
+// Single byte ranges are enough for PDF.js and native browser readers.
+export function fileByteRange(size, header) {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header);
+  if (!match || (!match[1] && !match[2]) || !size) throw failure(416, '无效的文件范围');
+  const first = match[1] ? Number(match[1]) : null;
+  const last = match[2] ? Number(match[2]) : null;
+  if ([first, last].some(value => value !== null && !Number.isSafeInteger(value))) throw failure(416, '无效的文件范围');
+  const start = first === null ? Math.max(0, size - last) : first;
+  const end = first === null || last === null ? size - 1 : Math.min(last, size - 1);
+  if (start > end || start >= size) throw failure(416, '无效的文件范围');
+  return { start, end };
 }

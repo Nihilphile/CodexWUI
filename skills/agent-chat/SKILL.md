@@ -1,9 +1,9 @@
 ---
 name: agent-chat
-description: Use agentctl to observe, message, stop, or branch CodexWeb sessions across processes, including creating a workspace conversation or a BTW side chat. Use for requests to coordinate with another CodexWeb agent.
+description: Use agentctl to observe, message, stop, or branch CodexWUI sessions across processes, including creating a workspace conversation or a BTW side chat. Use for requests to coordinate with another CodexWUI agent.
 ---
 
-Use `agentctl --help` for command syntax. The CLI connects to an already running local CodexWeb service, prints JSON, and exits. If the service is unavailable, report that; starting or restarting the service can interrupt other work.
+Use `agentctl --help` for command syntax. The CLI connects to an already running local CodexWUI service, prints JSON, and exits. If the service is unavailable, report that; starting or restarting the service can interrupt other work.
 
 Find the target with `agentctl '<workspace>' list`. Addresses are `<workspace>:1`, `1.sub1`, and `1.btw1`; short addresses resolve against the calling working directory. Use full addresses across projects. Check the returned `operations`: independently running CLI sessions are not controllable just because their history is visible. IDs remain stable across service restarts.
 

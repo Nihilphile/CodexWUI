@@ -15,14 +15,14 @@ const entry = path.join(root, 'server/index.mjs');
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 必须是 1–65535 的整数');
 await mkdir(dataDir, { recursive: true, mode: 0o700 });
 if (args.has('--help')) {
-  console.log('CodexWeb             后台启动并打开手机浏览器\nCodexWeb --no-open   后台启动，不打开浏览器\nCodexWeb --status    查看状态\nCodexWeb --stop      停止服务及其 Codex 进程\nCodexWeb --foreground 前台运行\n可用 PORT 设置端口，默认 4310。');
+  console.log('codexwui             后台启动并打开手机浏览器\ncodexwui --no-open   后台启动，不打开浏览器\ncodexwui --status    查看状态\ncodexwui --stop      停止服务及其 Codex 进程\ncodexwui --foreground 前台运行\n可用 PORT 设置端口，默认 4310。');
   process.exit();
 }
 async function probe() {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/api/bootstrap`, { signal: AbortSignal.timeout(1200) });
     const data = await response.json();
-    return data.app === 'termux-codex-web' && data.root === root ? data : null;
+    return ['codexwui', 'termux-codex-web'].includes(data.app) && data.root === root ? data : null;
   } catch { return null; }
 }
 async function savedProcess() {
@@ -41,12 +41,12 @@ async function savePid(pid) {
 }
 if (args.has('--stop')) {
   const record = await savedProcess();
-  if (!record) { console.log('没有找到由 CodexWeb 启动的后台服务。'); process.exit(); }
+  if (!record) { console.log('没有找到由 CodexWUI 启动的后台服务。'); process.exit(); }
   const inventory = new ProcessInventory(record.pid);
   inventory.scan();
   const identity = inventory.root.start;
   if (readProcess(record.pid)?.start === identity) process.kill(record.pid, 'SIGTERM');
-  console.log('正在停止 CodexWeb 并回收后台进程…');
+  console.log('正在停止 CodexWUI 并回收后台进程…');
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
     const value = readProcess(record.pid);
@@ -60,7 +60,7 @@ if (args.has('--stop')) {
   }
   const leftovers = await reapProcesses(inventory);
   if (leftovers.length) { console.error(`停止未完成：仍有 ${leftovers.length} 个进程未退出。请检查 Termux 进程状态。`); process.exit(1); }
-  console.log('CodexWeb 已停止，后续消息已保留为未发出。');
+  console.log('CodexWUI 已停止，后续消息已保留为未发出。');
   process.exit();
 }
 if (args.has('--status')) {
@@ -79,14 +79,14 @@ if (args.has('--foreground')) {
   await import('../server/index.mjs').then(async ({ createApp }) => {
     const app = await createApp({ dataDir });
     app.server.on('error', error => { console.error(error.message); void app.close(); process.exitCode = 1; });
-    app.server.listen(port, '127.0.0.1', () => console.log(`CodexWeb：${url}（Ctrl+C 停止）`));
+    app.server.listen(port, '127.0.0.1', () => console.log(`CodexWUI：${url}（Ctrl+C 停止）`));
     installShutdownHandlers(app);
   });
 } else {
   let running = await probe();
   if (!running) {
     if (await savedProcess()) {
-      console.error('已有 CodexWeb 服务仍在运行但暂未响应；不会重复启动。请用 CodexWeb --stop 等待清理后再启动。'); process.exit(1);
+      console.error('已有 CodexWUI 服务仍在运行但暂未响应；不会重复启动。请用 codexwui --stop 等待清理后再启动。'); process.exit(1);
     }
     const log = await open(path.join(dataDir, 'server.log'), 'a', 0o600);
     const child = spawn(process.execPath, [entry], { cwd: root, env: { ...process.env, DATA_DIR: dataDir, PORT: String(port) }, detached: true, stdio: ['ignore', log.fd, log.fd] });
@@ -99,12 +99,12 @@ if (args.has('--foreground')) {
       running = await probe();
       if (running) break;
     }
-    if (!running) { console.error(`启动失败，请查看 ${path.join(dataDir, 'server.log')}，或用 CodexWeb --foreground 查看错误。`); process.exit(1); }
+    if (!running) { console.error(`启动失败，请查看 ${path.join(dataDir, 'server.log')}，或用 codexwui --foreground 查看错误。`); process.exit(1); }
     // Concurrent launches may race for the port. The loser is reaped by its
     // server error handler; always record the process actually serving HTTP.
     if (running.serverPid) await savePid(running.serverPid);
   }
-  console.log(`CodexWeb：${url}\n后台运行中。停止：CodexWeb --stop`);
+  console.log(`CodexWUI：${url}\n后台运行中。停止：codexwui --stop`);
   if (!args.has('--no-open')) {
     const browser = spawn('termux-open-url', [url], { stdio: 'ignore', detached: true });
     browser.on('error', () => console.log(`请在浏览器打开 ${url}`));

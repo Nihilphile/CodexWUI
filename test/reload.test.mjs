@@ -18,8 +18,8 @@ test('reload waits through old service, downtime and new startup before refreshi
   const checks = [
     { app: 'termux-codex-web', serverInstance: 'old', connected: true },
     null,
-    { app: 'termux-codex-web', serverInstance: 'new', connected: false },
-    { app: 'termux-codex-web', serverInstance: 'new', connected: true },
+    { app: 'codexwui', serverInstance: 'new', connected: false },
+    { app: 'codexwui', serverInstance: 'new', connected: true },
   ];
   let saves = 0, refreshes = 0, starts = 0, polls = 0;
   const messages = [];

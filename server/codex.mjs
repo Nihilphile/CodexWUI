@@ -29,7 +29,7 @@ export class CodexConnection extends EventEmitter {
     if (this.process || this.closing) throw new Error('此 Codex 连接已启动或已关闭');
     this.process = this.spawnProcess(process.execPath, [supervisor, this.binary, 'app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe', 'ipc'], detached: true,
-      env: { ...process.env, CODEXWEB_SUPERVISOR_LIMITS: JSON.stringify(this.limits) },
+      env: { ...process.env, CODEXWUI_SUPERVISOR_LIMITS: JSON.stringify(this.limits) },
     });
     this.exited = new Promise(resolve => {
       this.process.once('exit', () => resolve());
@@ -84,7 +84,7 @@ export class CodexConnection extends EventEmitter {
     });
     try {
       this.info = await this.request('initialize', {
-        clientInfo: { name: 'termux_codex_web', title: 'Termux Codex Web', version: '0.1.0' },
+        clientInfo: { name: 'codexwui', title: 'CodexWUI', version: '0.1.0' },
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
       this.send({ method: 'initialized', params: {} });
@@ -169,7 +169,7 @@ export class CodexConnection extends EventEmitter {
       if (!pending) return;
       clearTimeout(pending.timer);
       this.pending.delete(message.id);
-      if (message.error) pending.reject(Object.assign(new Error(message.error.message || JSON.stringify(message.error)), { rpcRejected: true }));
+      if (message.error) pending.reject(Object.assign(new Error(message.error.message || JSON.stringify(message.error)), { rpcRejected: true, code: message.error.code, data: message.error.data }));
       else pending.resolve(message.result);
     }
   }

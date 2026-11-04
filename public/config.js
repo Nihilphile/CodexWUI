@@ -14,11 +14,17 @@
       this.dialog.setAttribute('aria-labelledby', 'config-title');
       this.dialog.innerHTML = `<form id="config-form">
         <div class="dialog-heading"><h2 id="config-title">全局设置</h2><button type="button" class="icon-button" data-config-close aria-label="关闭全局设置">×</button></div>
-        <p class="muted">作用于这个 CodexWeb 服务，保存后动态生效。默认模型与强度用于新建主会话，已有会话保留自己的设置。</p>
+        <p class="muted">作用于这个 CodexWUI 服务，保存后动态生效。默认模型、强度与权限用于新建主会话，已有会话保留自己的设置。</p>
         <div class="config-fields">${FIELDS.map(([key, label, hint]) => `<div class="config-field"><label for="config-${key}">${label} <small data-config-source="${key}"></small></label><input id="config-${key}" name="${key}" type="number" min="${key === 'idleMinutes' || key === 'maxFileMb' ? '0.000001' : '1'}" step="${key === 'idleMinutes' || key === 'maxFileMb' ? 'any' : '1'}" required><p class="muted">${hint}</p></div>`).join('')}</div>
+        <label for="config-fileExpandMode">文件展开形式 <small data-config-source="fileExpandMode"></small></label>
+        <select id="config-fileExpandMode" name="fileExpandMode"><option value="panel">填满工作区面板（默认）</option><option value="fullscreen">全屏展开（类似可视化组件）</option></select>
+        <p class="muted">文件工具栏的“展开”使用此形式。收起左侧会话列表后，打开的工作区面板与对话区各占一半。</p>
         <label for="config-defaultModel">默认模型 <small data-config-source="defaultModel"></small></label><select id="config-defaultModel" name="defaultModel"></select>
         <label for="config-defaultEffort">默认推理强度 <small data-config-source="defaultEffort"></small></label><select id="config-defaultEffort" name="defaultEffort"></select>
         <p data-config-model-note class="muted"></p>
+        <label for="config-defaultAuthority">会话初始权限 <small data-config-source="defaultAuthority"></small></label>
+        <select id="config-defaultAuthority" name="defaultAuthority"><option value="default">默认</option><option value="read-only">只读</option><option value="workspace">工作区</option><option value="full">完全访问</option></select>
+        <p data-config-authority-note class="muted"></p>
         <p class="muted">配置保存在数据目录的 config.json，优先于启动环境变量。Codex 已退出时保存资源设置，需重启服务才能恢复后端。</p>
         <p data-config-error class="error-text" role="alert"></p><p data-config-status class="muted" role="status"></p>
         <div class="config-actions"><button type="button" class="secondary-button" data-config-refresh>重新读取</button><button type="submit" class="primary-button" data-config-save>保存设置</button></div>
@@ -28,6 +34,7 @@
       this.models = [];
       this.dialog.querySelector('[data-config-close]').onclick = () => this.dialog.close();
       this.dialog.querySelector('[data-config-refresh]').onclick = () => { void this.open(); };
+      this.field('defaultAuthority').onchange = () => this.renderAuthority();
       this.field('defaultModel').onchange = () => { this.renderEfforts(null); };
       this.form.onsubmit = event => { event.preventDefault(); void this.save(); };
     }
@@ -47,6 +54,10 @@
       if (preferred && ![...select.options].some(option => option.value === preferred)) select.add(new Option(`${preferred}（已保存）`, preferred));
       select.value = preferred || ''; select.disabled = !this.field('defaultModel').value || !model;
     }
+    renderAuthority() {
+      const descriptions = { default: '使用本机 Codex 权限配置。', 'read-only': '只读沙箱；需要额外权限时询问。', workspace: '允许写入工作区；需要额外权限时询问。', full: '不限制文件与网络访问，命令执行不请求审批。' };
+      this.dialog.querySelector('[data-config-authority-note]').textContent = descriptions[this.field('defaultAuthority').value] + ' 仅用于之后新建的主会话；已有会话在顶部 Authority 单独修改。';
+    }
     async open() {
       if (this.saving || this.loading) return;
       this.loading = true; this.showError('');
@@ -56,6 +67,8 @@
         this.editRevision = snapshot.revision;
         this.editInstance = snapshot.instance;
         for (const [key] of FIELDS) this.field(key).value = snapshot.settings[key];
+        this.field('fileExpandMode').value = snapshot.settings.fileExpandMode || 'panel';
+        this.field('defaultAuthority').value = snapshot.settings.defaultAuthority || 'default'; this.renderAuthority();
         for (const key of Object.keys(snapshot.sources)) {
           const label = this.dialog.querySelector(`[data-config-source="${key}"]`);
           if (label) label.textContent = SOURCES[snapshot.sources[key]] || '';
@@ -84,11 +97,13 @@
       const settings = Object.fromEntries(FIELDS.map(([key]) => [key, Number(this.field(key).value)]));
       settings.defaultModel = this.field('defaultModel').value || null;
       settings.defaultEffort = settings.defaultModel ? this.field('defaultEffort').value || null : null;
+      settings.fileExpandMode = this.field('fileExpandMode').value;
+      settings.defaultAuthority = this.field('defaultAuthority').value;
       controls.forEach(control => { control.disabled = true; });
       try {
         const snapshot = await this.api('/api/config', { settings, revision: this.editRevision, instance: this.editInstance });
         this.sync(snapshot); this.editRevision = snapshot.revision; this.editInstance = snapshot.instance;
-        this.dialog.querySelector('[data-config-status]').textContent = '已保存并应用。默认模型与强度从新建主会话起使用。';
+        this.dialog.querySelector('[data-config-status]').textContent = '已保存并应用。默认模型、强度与权限从新建主会话起使用。';
         for (const label of this.dialog.querySelectorAll('[data-config-source]')) label.textContent = '已保存';
       } catch (error) { this.showError(error.message); }
       finally { this.saving = false; controls.forEach((control, index) => { control.disabled = disabled[index]; }); }

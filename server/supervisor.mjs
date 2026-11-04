@@ -6,7 +6,8 @@ import { validateResourceLimits } from './limits.mjs';
 // A separate process survives an abrupt Web-owner exit. RPC bytes pass through
 // unchanged; resource and shutdown messages use an independent IPC channel.
 const [binary, ...args] = process.argv.slice(2);
-const limits = JSON.parse(process.env.CODEXWEB_SUPERVISOR_LIMITS);
+const limits = JSON.parse(process.env.CODEXWUI_SUPERVISOR_LIMITS ?? process.env.CODEXWEB_SUPERVISOR_LIMITS);
+delete process.env.CODEXWUI_SUPERVISOR_LIMITS;
 delete process.env.CODEXWEB_SUPERVISOR_LIMITS;
 const owner = readProcess(process.ppid);
 const native = loadSubreaper();

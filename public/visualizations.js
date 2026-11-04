@@ -1,5 +1,5 @@
 (() => {
-  const own = item => item?.type === 'mcpToolCall' && item.server === 'codexweb_visualize' && item.tool === 'visualize';
+  const own = item => item?.type === 'mcpToolCall' && ['codexwui_visualize', 'codexweb_visualize'].includes(item.server) && item.tool === 'visualize';
   const idPattern = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
   const sizeOf = value => new Blob([JSON.stringify(value)]).size;
   class CodexVisualizations {

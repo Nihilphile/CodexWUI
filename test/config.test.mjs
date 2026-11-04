@@ -17,12 +17,12 @@ async function directory(t) {
   t.after(() => rm(dir, { recursive: true, force: true })); return dir;
 }
 async function fixture(t) {
-  const dir = await directory(t), dataDir = path.join(dir, 'data');
+  const dir = await mkdtemp(path.join(tmpdir(), 'codex-config-')), dataDir = path.join(dir, 'data');
   const codex = new FakeCodex(dir);
   codex.updateLimits = async limits => { codex.appliedLimits = { ...limits }; };
   const app = await createApp({ codex, dataDir, initialProject: dir, limits: resourceLimits({}), maxFileBytes: 100 * 1024 * 1024 });
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening'); await app.startup;
-  t.after(() => app.close());
+  t.after(async () => { await app.close(); await rm(dir, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${app.server.address().port}`;
   const request = async (url, data, options = {}) => {
     const response = await fetch(base + url, { ...(data === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }), ...options });
@@ -38,18 +38,21 @@ async function until(predicate) {
 
 test('config serializes saves, rejects stale revisions and survives restart with precedence over environment', async t => {
   const dir = await directory(t);
-  const options = { dataDir: dir, limits: resourceLimits({ CODEXWEB_MAX_RSS_MB: '5000' }), maxFileBytes: 100 * 1024 * 1024, env: { CODEXWEB_MAX_RSS_MB: '5000' } };
+  const options = { dataDir: dir, limits: resourceLimits({ CODEXWUI_MAX_RSS_MB: '5000' }), maxFileBytes: 100 * 1024 * 1024, env: { CODEXWUI_MAX_RSS_MB: '5000' } };
   const config = new AppConfig(options); await config.load();
+  assert.equal(config.value.fileExpandMode, 'panel');
+  assert.equal(config.snapshot().sources.fileExpandMode, 'default');
   assert.equal(config.snapshot().sources.maxRssMb, 'environment');
   const applied = [], changed = [];
   const hooks = { apply: async next => { await tick(); applied.push(next.maxRssMb); }, changed: value => changed.push(value) };
-  const a = config.update({ maxRssMb: 6000 }, 0, hooks);
+  const a = config.update({ maxRssMb: 6000, fileExpandMode: 'fullscreen' }, 0, hooks);
   const b = assert.rejects(config.update({ maxRssMb: 7000 }, 0, hooks), { status: 409 });
   await a; await b;
   assert.deepEqual(applied, [6000]); assert.equal(changed.length, 1);
   assert.equal((await stat(config.file)).mode & 0o777, 0o600);
   const restored = new AppConfig(options); await restored.load();
   assert.equal(restored.value.maxRssMb, 6000); assert.equal(restored.snapshot().sources.maxRssMb, 'saved');
+  assert.equal(restored.value.fileExpandMode, 'fullscreen');
   assert.deepEqual(await readdir(dir), ['config.json']);
 });
 
@@ -57,7 +60,7 @@ test('invalid or rejected updates leave disk, revision and live settings unchang
   const dir = await directory(t), config = new AppConfig({ dataDir: dir, limits: resourceLimits({}), maxFileBytes: 104857600, env: {} });
   let calls = 0;
   const hooks = { apply: async () => { calls++; throw Object.assign(new Error('RAM 上限低于当前用量'), { status: 409 }); } };
-  for (const patch of [{ maxActiveTurns: 0 }, { maxRssMb: '4096' }, { maxFileMb: Infinity }, { unknown: true }, { defaultEffort: 'high' }]) {
+  for (const patch of [{ maxActiveTurns: 0 }, { maxRssMb: '4096' }, { maxFileMb: Infinity }, { unknown: true }, { defaultEffort: 'high' }, { fileExpandMode: 'window' }, { fileExpandMode: null }]) {
     await assert.rejects(config.update(patch, 0, hooks), { status: 400 });
   }
   assert.equal(calls, 0);
@@ -192,7 +195,10 @@ test('browser config panel saves, reports concurrent edits and remains usable wi
     const response = await request(url, data); if (response.status >= 400) throw new Error(response.body.error); return response.body;
   }, notify() {}, changed: value => { sync = value; } });
   await panel.open(); assert.equal(panel.dialog.open, true);
+  assert.equal(panel.field('fileExpandMode').value, 'panel');
+  panel.field('fileExpandMode').value = 'fullscreen';
   panel.field('maxActiveTurns').value = '4'; await panel.save(); assert.equal(sync.settings.maxActiveTurns, 4);
+  assert.equal(sync.settings.fileExpandMode, 'fullscreen');
   const revision = sync.revision;
   const external = await request('/api/config', { instance: sync.instance, revision, settings: { maxActiveTurns: 3 } });
   panel.sync(external.body); panel.field('maxActiveTurns').value = '5';
@@ -235,4 +241,25 @@ test('served app opens /config without creating a thread and receives config upd
   await until(() => /8G/.test($('memory-usage').textContent));
   assert.match($('config-form').querySelector('[data-config-status]').textContent, /其他页面更新/);
   assert.deepEqual(errors, []);
+});
+
+test('initial authority applies only to new main conversations and persists with config', async t => {
+  const { request, project, codex, dataDir } = await fixture(t);
+  const old = (await request('/api/threads', { project: project.id })).body.thread.id;
+  let config = (await request('/api/config')).body;
+  const save = await request('/api/config', { instance: config.instance, revision: config.revision, settings: { defaultAuthority: 'workspace' } });
+  assert.equal(save.status, 200); config = save.body;
+  const created = await request('/api/threads', { project: project.id });
+  assert.equal(created.body.authority, 'workspace');
+  const start = codex.calls.filter(c => c.method === 'thread/start').at(-1).params;
+  assert.equal(start.permissions, ':workspace'); assert.equal(start.approvalPolicy, 'on-request');
+  assert.equal((await request(`/api/threads/${old}`)).body.authority, 'default');
+  assert.equal(JSON.parse(await readFile(path.join(dataDir, 'config.json'), 'utf8')).defaultAuthority, 'workspace');
+  const invalid = await request('/api/config', { instance: config.instance, revision: config.revision, settings: { defaultAuthority: 'unsafe-typo' } });
+  assert.equal(invalid.status, 400);
+  const reset = await request('/api/config', { instance: config.instance, revision: config.revision, settings: { defaultAuthority: 'default' } });
+  assert.equal(reset.status, 200);
+  await request('/api/threads', { project: project.id });
+  assert.equal(codex.calls.filter(c => c.method === 'thread/start').at(-1).params.permissions, undefined);
+  assert.equal((await request(`/api/threads/${created.body.thread.id}`)).body.authority, 'workspace');
 });

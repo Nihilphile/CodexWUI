@@ -1,27 +1,35 @@
 import http from 'node:http';
 import { pipeline } from 'node:stream/promises';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
 import { prepareReload } from './reload.mjs';
 import { readFile, writeFile, mkdir, rename, realpath, stat } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
 import { CodexConnection } from './codex.mjs';
+import { AccountQuota } from './account-quota.mjs';
 import { LiveState } from './state.mjs';
 import { gitStatus, gitDiff } from './git.mjs';
 import { FollowUpQueue } from './queue.mjs';
 import { AgentService, deliveryText } from './agents.mjs';
-import { listDirectory, readTextFile, readFilePreview, openFileContent } from './files.mjs';
+import { listDirectory, readTextFile, readFilePreview, openFileContent, fileByteRange, uploadProjectFile } from './files.mjs';
 import { AttachmentStore, fileUploadLimit } from './attachments.mjs';
 import { ImageStore, MAX_IMAGE_BYTES } from './images.mjs';
 import { BtwSessions } from './btw.mjs';
 import { StudyCards } from './studycards.mjs';
+import { CARD_PREFIX, CARD_CSP, isStudyCardHTML } from './studycard-html.mjs';
 import { VisualizationStore, visualizationConfig, visualizationItem, visualizationTurns, VISUALIZE_INSTRUCTIONS } from './visualizations.mjs';
 import { PendingSteers } from './steers.mjs';
 import { SessionLifecycle } from './lifecycle.mjs';
 import { resourceLimits } from './limits.mjs';
 import { AppConfig, configLimits } from './config.mjs';
+import { ThreadAuthority, authorityParams } from './authority.mjs';
+import { ThreadUsage } from './thread-usage.mjs';
+import { PluginService } from './plugins.mjs';
 import { installShutdownHandlers } from './runtime.mjs';
+import { ProjectTerminals } from './terminals.mjs';
+import { RecoveryStore, failureInfo, recoveryMode, operationId } from './recovery.mjs';
+import { TurnHistory } from './turn-history.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SOURCES = ['cli', 'vscode', 'exec', 'appServer', 'subAgentThreadSpawn'];
@@ -52,8 +60,17 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const config = new AppConfig({ dataDir, limits, maxFileBytes });
   await config.load();
+  const authority = new ThreadAuthority(path.join(dataDir, 'thread-authority.json'));
+  const usage = new ThreadUsage(path.join(dataDir, 'thread-usage.json'));
+  await authority.load();
+  await usage.load();
   Object.assign(limits, configLimits(config.value));
   codex ||= new CodexConnection({ limits });
+  const recovery = new RecoveryStore(path.join(dataDir, 'recovery.json'));
+  const turnHistory = new TurnHistory(codex, path.join(dataDir, 'forks.json'));
+  await recovery.load();
+  await turnHistory.load();
+  const accountQuota = new AccountQuota(codex);
   const attachments = new AttachmentStore(path.join(dataDir, 'attachments'), { maxBytes: config.value.maxFileMb * 1024 * 1024 });
   const images = new ImageStore(path.join(dataDir, 'uploads'));
   const visualizations = new VisualizationStore(path.join(dataDir, 'visualizations'));
@@ -94,6 +111,7 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
     return project;
   }
   const live = new LiveState();
+  const terminals = new ProjectTerminals();
   const clients = new Set();
   const events = [];
   let eventBytes = 0;
@@ -101,9 +119,15 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
   const loaded = new Set();
   const loading = new Map();
   const starting = new Set();
+  const stopRevisions = new Map();
   const completionPending = new Map();
   let connectionError = null;
   const skillCache = new Map();
+  let skillGeneration = 0;
+  function invalidateSkills() { skillGeneration++; skillCache.clear(); }
+  const plugins = new PluginService({ codex, changed: () => {
+    invalidateSkills(); broadcast({ method: 'web/plugins', params: {} });
+  } });
   let modelCatalog = null;
   const agentTimes = new Map();
   async function agentWithCompletion(child) {
@@ -137,7 +161,7 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
     busy: id => lifecycle.busy(btw.records.get(id)?.threadId || id),
     run: (id, entry) => {
       const side = btw.records.get(id);
-      return side ? btw.send(side.parentId, deliveryText(entry), side.id) : startTurn(id, entry);
+      return side ? btw.send(side.parentId, { ...entry, text: deliveryText(entry) }, side.id) : startTurn(id, entry);
     },
     changed: id => {
       const side = btw.records.get(id);
@@ -160,7 +184,7 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
     queue.complete(queueKey(id), status);
   };
   const lifecycle = new SessionLifecycle({ codex, live, starting, limits, pause: id => queue.pause(queueKey(id)) });
-  const btw = new BtwSessions({ codex, live, lifecycle, starting, dataDir, broadcast, queue, steers, settled,
+  const btw = new BtwSessions({ codex, live, lifecycle, starting, dataDir, broadcast, queue, steers, settled, attachments, images,
     parent: async id => {
       if (btw.owns(id)) throw httpError(400, '请从主会话打开 BTW');
       const metadata = await readThread(id);
@@ -187,26 +211,35 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
       }
       const result = await codex.request(sourceId ? 'thread/fork' : 'thread/start', {
         ...(sourceId ? { threadId: sourceId, excludeTurns: true, deferGoalContinuation: true } : {}),
-        cwd, ...(model ? { model } : {}),
+        cwd, ...(model ? { model } : {}), ...(!sourceId ? authorityParams(config.value.defaultAuthority) : {}),
         config: { ...visualizationConfig(cwd, dataDir), ...(effort ? { model_reasoning_effort: effort } : {}) },
       });
+      const initialAuthority = sourceId ? authority.get(sourceId) : config.value.defaultAuthority;
+      const inheritedAuthority = sourceId && authority.records.get(sourceId);
+      if (inheritedAuthority || initialAuthority !== 'default') await authority.save(result.thread.id, initialAuthority, inheritedAuthority?.params || authorityParams(initialAuthority));
       loaded.add(result.thread.id); lifecycle.markLoaded(result.thread.id);
       return result.thread;
     },
   });
   await agents.load();
-  const studycards = new StudyCards({ dataDir, broadcast });
+  const studycards = new StudyCards({ dataDir, broadcast, visualizations });
   await studycards.load();
   codex.dynamicToolHandler = params => btw.tool(params);
-  const resources = () => ({ ...(codex.resources || {}), limits,
+  const resources = () => {
+    const manualTerminals = terminals.resources();
+    return { ...(codex.resources || {}),
+    rssMb: codex.resources?.rssMb == null ? null : codex.resources.rssMb + manualTerminals.rssMb,
+    manualTerminals, limits,
     activeTurns: [...live.threads].filter(([id, value]) => !value.metadata?.parentThreadId && lifecycle.busy(id)).length,
-    cleaning: lifecycle.cleaning.size });
+    cleaning: lifecycle.cleaning.size };
+  };
 
   function broadcast(message) {
     const p = message.params;
     if (p?.item) message = { ...message, params: { ...p, item: visualizationItem(p.item) } };
     if (p?.turn?.items) message = { ...message, params: { ...message.params, turn: visualizationTurns([p.turn])[0] } };
     live.ingest(message);
+    usage.ingest(message);
     const entry = { id: ++sequence, data: message };
     const wire = `id: ${entry.id}\ndata: ${JSON.stringify(entry.data)}\n\n`;
     events.push({ id: entry.id, wire });
@@ -218,6 +251,13 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
     }
   }
   const onNotification = message => {
+    if (message.method === 'error') message = { ...message, params: { ...message.params, failure: failureInfo(message.params.error) } };
+    if (message.method === 'turn/completed') {
+      recovery.ingest(message.params.threadId, message.params.turn);
+      message = { ...message, params: { ...message.params, turn: decorateTurn(message.params.threadId, message.params.turn) } };
+    }
+    accountQuota.ingest(message);
+    if (message.method === 'skills/changed') invalidateSkills();
     if (message.method === 'thread/started') agents.own(message.params.thread.id);
     if (['turn/started', 'turn/completed', 'thread/closed'].includes(message.method)) agentTimes.delete(message.params.threadId);
     const request = message.method === 'web/approval' ? message.params : null;
@@ -239,6 +279,7 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
   codex.on('notification', onNotification);
   const onConnection = state => {
     connectionError = state.error || null;
+    if (!state.connected) accountQuota.invalidate();
     if (!state.connected) { loaded.clear(); loading.clear(); lifecycle.disconnect(); queue.pauseAll(); steers.disconnect(); studycards.disconnect(); }
     broadcast({ method: 'web/connection', params: state });
   };
@@ -254,7 +295,8 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
         ...(projects.some(project => project.path === metadata.cwd) && !metadata.parentThreadId
           ? { config: visualizationConfig(metadata.cwd, dataDir) } : {}),
       }))
-        .then(result => {
+        .then(async result => {
+          await authority.restore(id, codex);
           loaded.add(id); lifecycle.markLoaded(id); agents.own(id);
           live.get(id).metadata = { ...result.thread, turns: [] };
           return result;
@@ -273,7 +315,9 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
 
   async function skillsFor(cwd, refresh = false) {
     if (!skillCache.has(cwd) || refresh) {
+      const generation = skillGeneration;
       const result = await codex.request('skills/list', { cwds: [cwd], forceReload: refresh });
+      if (generation !== skillGeneration) return skillsFor(cwd, true);
       const skills = (result.data || []).flatMap(group => group.skills || []).filter(skill => skill.enabled !== false);
       skillCache.set(cwd, skills);
     }
@@ -301,6 +345,16 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
     return [...items, ...imageInputs, ...fileInputs];
   }
   async function startTurn(id, input) {
+    const requestId = input.clientUserMessageId || (input.id ? `${input.id}-${input.revision || 1}` : randomUUID());
+    const stopRevision = input.stopRevision ?? (stopRevisions.get(id) || 0);
+    return recovery.execute({ id: requestId, threadId: id, input: {
+      text: input.originalText ?? input.text, skills: input.skills || [], images: input.images || [], files: input.files || [],
+      ...(input.source ? { source: input.source } : {}), ...(input.agentDelivery ? { agentDelivery: true } : {}),
+    }, sourceTurnId: input.sourceTurnId || null, sourceRecoveryId: input.sourceRecoveryId || null, model: input.model || null, effort: input.effort || null }, submitted => dispatchTurn(id, input, requestId, submitted, stopRevision));
+  }
+  async function dispatchTurn(id, input, requestId, submitted, stopRevision) {
+    const checkStopped = () => { if ((stopRevisions.get(id) || 0) !== stopRevision) throw Object.assign(httpError(409, '任务已停止，本次恢复已取消'), { rpcRejected: true }); };
+    checkStopped();
     if (starting.has(id) || live.get(id).activeTurnId) throw httpError(409, '这个会话正在执行，请使用引导或排队');
     lifecycle.reserve(id);
     let capture;
@@ -311,8 +365,12 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
       items.push({ type: 'text', text: VISUALIZE_INSTRUCTIONS, text_elements: [] });
       capture = await studycards.prepare(id, metadata.cwd);
       if (capture) items.push(capture.input);
-      const result = await codex.request('turn/start', { threadId: id, input: items, ...(input.source ? { clientUserMessageId: input.id } : {}) });
+      await submitted();
+      checkStopped();
+      const result = await codex.request('turn/start', { threadId: id, input: items, clientUserMessageId: requestId,
+        ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}) });
       studycards.accepted(capture, result.turn);
+      recovery.ingest(id, live.snapshot(id)?.turns.find(turn => turn.id === result.turn.id) || result.turn);
       return result;
     } catch (error) {
       studycards.rejected(capture);
@@ -324,6 +382,60 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
         queue.complete(id, status);
       }
     }
+  }
+
+  function decorateTurn(id, turn) {
+    const next = recovery.forThread(id).find(entry => entry.sourceTurnId === turn.id && entry.turnId);
+    return { ...turn, failure: turn.error ? failureInfo(turn.error) : null, recoveryMode: recoveryMode(turn), recoveredBy: next?.turnId || null };
+  }
+  async function editableThread(id) {
+    const metadata = await readThread(id);
+    if (metadata.parentThreadId || metadata.canAcceptDirectInput === false) throw httpError(409, '子代理会话在这里仅供查看');
+    if (!projects.some(p => p.path === metadata.cwd)) throw httpError(403, '请先添加这个会话所属的项目目录');
+    return metadata;
+  }
+  function originalInput(id, turn) {
+    const saved = recovery.forTurn(id, turn.id);
+    if (saved) return saved.input;
+    const input = { text: '', skills: [], images: [], files: [] }, lines = [];
+    const messages = turn.items.filter(item => item.type === 'userMessage');
+    if (!messages.length) throw httpError(409, '这一轮没有可恢复的用户输入');
+    for (const item of messages) for (const part of item.content || []) {
+      if (part.type === 'text') {
+        if (part.text.startsWith('[CodexWUI visualization instructions]') || part.text.startsWith('[CodexWUI StudyCard instructions]')) continue;
+        const prefix = '用户上传的文件（可使用本机工具读取）：';
+        if (part.text.startsWith(prefix)) {
+          let file; try { file = JSON.parse(part.text.slice(prefix.length)); } catch { throw httpError(409, '文件记录不完整，请重新选择附件'); }
+          const fileId = path.basename(file.path);
+          if (attachments.location(fileId) !== file.path) throw httpError(409, '文件来自其他位置，请重新选择附件');
+          input.files.push(fileId);
+        } else lines.push(part.text);
+      } else if (part.type === 'skill') input.skills.push({ name: part.name, path: part.path });
+      else if (part.type === 'localImage') {
+        const imageId = path.basename(part.path);
+        if (images.location(imageId) !== part.path) throw httpError(409, '图片来自其他位置，请重新选择附件');
+        input.images.push(imageId);
+      } else throw httpError(409, '这条历史消息包含无法自动恢复的附件，请重新选择后发送');
+    }
+    input.text = lines.join('\n\n');
+    return input;
+  }
+  async function forkThread(id, input) {
+    const metadata = await editableThread(id);
+    const turnId = text(input.turnId, '轮次', 200);
+    const { turn } = await turnHistory.read(id, turnId);
+    if (turn.status === 'inProgress') throw httpError(409, '请等待这一轮结束后再分叉');
+    const name = `fork ${metadata.name || metadata.preview || '新会话'}`.slice(0, 200);
+    return turnHistory.fork({ id: operationId(input.actionId), source: id, turnId, before: Boolean(input.before) },
+      () => codex.request('thread/fork', { threadId: id, [input.before ? 'beforeTurnId' : 'lastTurnId']: turnId,
+        excludeTurns: true, deferGoalContinuation: true, config: visualizationConfig(metadata.cwd, dataDir) }),
+      async forkId => {
+        const inherited = authority.records.get(id);
+        if (inherited) await authority.save(forkId, authority.get(id), inherited.params);
+        await codex.request('thread/name/set', { threadId: forkId, name });
+        loaded.add(forkId); lifecycle.markLoaded(forkId); agents.own(forkId);
+        return { thread: { ...await readThread(forkId), name }, authority: authority.get(forkId) };
+      });
   }
 
   const server = http.createServer(async (req, res) => {
@@ -344,7 +456,10 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
       // public HTML shell is safe to open; session APIs must remain same-origin.
       const homepageNavigation = req.method === 'GET' && route === '/' &&
         req.headers['sec-fetch-mode'] === 'navigate' && req.headers['sec-fetch-dest'] === 'document';
-      if (!homepageNavigation) {
+      // The opaque Mermaid frame can read only its two public scripts.
+      const mermaidScript = req.method === 'GET' &&
+        ['/mermaid-renderer.js', '/vendor/mermaid/mermaid.min.js'].includes(route);
+      if (!homepageNavigation && !mermaidScript) {
         if (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) throw httpError(403, '不允许跨站请求');
         if (req.headers['sec-fetch-site'] === 'cross-site') throw httpError(403, '不允许跨站请求');
       }
@@ -397,6 +512,24 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
         return json(res, { restarting: true, serverInstance }, 202);
       }
       if (reloadRequest && req.method !== 'GET') throw httpError(503, '服务正在重启，请等待恢复');
+      if (route === '/api/terminals') {
+        if (req.method === 'GET') return json(res, terminals.list(projectFor(query.get('project'))));
+        if (req.method !== 'POST') throw httpError(405, '不支持的终端操作');
+        const input = await body(req);
+        return json(res, { terminal: await terminals.create(projectFor(input.project), input) }, 201);
+      }
+      const terminalRoute = route.match(/^\/api\/terminals\/([^/]+)\/(events|input|resize|close)$/);
+      if (terminalRoute) {
+        const [, id, action] = terminalRoute;
+        if (action === 'events' && req.method === 'GET') {
+          return terminals.stream(projectFor(query.get('project')), id, req, res, Number(req.headers['last-event-id'] || query.get('after') || 0));
+        }
+        if (req.method !== 'POST' || action === 'events') throw httpError(405, '不支持的终端操作');
+        const input = await body(req), project = projectFor(input.project);
+        if (action === 'input') return json(res, await terminals.input(project, id, input.data));
+        if (action === 'resize') return json(res, terminals.resize(project, id, input.cols, input.rows));
+        return json(res, await terminals.remove(project, id));
+      }
       if (route === '/api/config') {
         if (req.method === 'GET') return json(res, config.snapshot());
         if (req.method !== 'POST') throw httpError(405, '不支持的配置操作');
@@ -448,9 +581,10 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
         return;
       }
       if (req.method === 'GET' && route === '/api/bootstrap') {
-        return json(res, { app: 'termux-codex-web', root: ROOT, serverPid: process.pid, serverInstance, config: config.snapshot(), projects, connected: codex.ready, error: connectionError, resources: resources(), uploadLimits: { fileBytes: attachments.maxBytes, imageBytes: MAX_IMAGE_BYTES }, live: live.summary(), approvals: [...codex.approvals.values()], btwSessions: [...btw.records.values()] });
+        return json(res, { app: 'codexwui', root: ROOT, serverPid: process.pid, serverInstance, config: config.snapshot(), projects, connected: codex.ready, error: connectionError, resources: resources(), features: { workspaceUpload: true, terminals: true }, uploadLimits: { fileBytes: attachments.maxBytes, imageBytes: MAX_IMAGE_BYTES }, live: live.summary(), approvals: [...codex.approvals.values()], btwSessions: [...btw.records.values()] });
       }
       if (req.method === 'GET' && route === '/api/resources') return json(res, resources());
+      if (req.method === 'GET' && route === '/api/account/quota') return json(res, await accountQuota.read({ refresh: query.get('refresh') === '1' }));
       if (req.method === 'POST' && route === '/api/attachments') return json(res, await attachments.upload(req), 201);
       if (req.method === 'POST' && route === '/api/images') return json(res, await images.upload(req), 201);
       if (req.method === 'GET' && route.startsWith('/api/images/')) {
@@ -464,18 +598,51 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
       }
       if (req.method === 'GET' && route === '/api/git/status') return json(res, await gitStatus(projectFor(query.get('project')).path));
       if (req.method === 'GET' && route === '/api/files/list') return json(res, await listDirectory(projectFor(query.get('project')).path, query.get('path') || ''));
+      if (req.method === 'POST' && route === '/api/files/upload') {
+        if (req.headers['content-type']?.split(';')[0].trim() !== 'application/octet-stream') throw httpError(415, '需要二进制文件请求');
+        return json(res, await uploadProjectFile(projectFor(query.get('project')).path, query.get('path') || '', req, attachments.maxBytes), 201);
+      }
       if (req.method === 'GET' && route === '/api/files/read') return json(res, await readTextFile(projectFor(query.get('project')).path, query.get('path')));
       if (req.method === 'GET' && route === '/api/files/preview') return json(res, await readFilePreview(projectFor(query.get('project')).path, query.get('path')));
-      if (req.method === 'GET' && route === '/api/files/content') {
+      if (req.method === 'GET' && ['/api/files/studycard', '/api/files/html'].includes(route)) {
+        const file = await openFileContent(projectFor(query.get('project')).path, query.get('path'));
+        try {
+          if (!/\.html?$/i.test(file.relative)) throw httpError(400, '不是可预览的 HTML 文件');
+          if (file.size > 33 * 1024 * 1024) throw httpError(413, 'HTML 预览最多 33 MiB，请下载查看');
+          if (route === '/api/files/studycard') {
+            if (!file.relative.startsWith('StudyCard/')) throw httpError(400, '不是可预览的 StudyCard HTML');
+            const prefix = Buffer.alloc(Buffer.byteLength(CARD_PREFIX));
+            await file.handle.read(prefix, 0, prefix.length, 0);
+            if (!isStudyCardHTML(prefix.toString('utf8'))) throw httpError(400, '不是可预览的 StudyCard HTML');
+          }
+          res.setHeader('Content-Security-Policy', `sandbox allow-scripts; ${CARD_CSP}; frame-ancestors 'self'`);
+          res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': file.size, 'Cache-Control': 'no-store' });
+          await pipeline(file.handle.createReadStream({ start: 0, autoClose: false }), res);
+        } finally { await file.handle.close(); }
+        return;
+      }
+      if (['GET', 'HEAD'].includes(req.method) && route === '/api/files/content') {
         const file = await openFileContent(projectFor(query.get('project')).path, query.get('path'));
         try {
           // Even a mislabeled SVG/HTML file must not run scripts with app access.
           res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; style-src 'unsafe-inline'");
+          // Only PDF bytes may use a native viewer. Keep HTML/SVG downloads inert.
+          if (file.kind === 'pdf' && query.get('browser') === '1' && query.get('download') !== '1') {
+            res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'");
+            res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+          }
+          let range;
+          try { range = fileByteRange(file.size, req.headers.range); }
+          catch (error) { res.setHeader('Content-Range', `bytes */${file.size}`); throw error; }
+          res.setHeader('Accept-Ranges', 'bytes');
+          if (range) res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${file.size}`);
           const name = encodeURIComponent(path.basename(file.relative)).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
-          res.writeHead(200, { 'Content-Type': query.get('download') === '1' ? 'application/octet-stream' : file.type,
-            'Content-Length': file.size, 'Cache-Control': 'no-store',
+          res.writeHead(range ? 206 : 200, { 'Content-Type': query.get('download') === '1' ? 'application/octet-stream' : file.type,
+            'Content-Length': range ? range.end - range.start + 1 : file.size, 'Cache-Control': 'no-store',
             'Content-Disposition': `${query.get('download') === '1' ? 'attachment' : 'inline'}; filename*=UTF-8''${name}` });
-          await pipeline(file.handle.createReadStream({ autoClose: false }), res);
+          if (req.method === 'HEAD' || !file.size) res.end();
+          else await pipeline(file.handle.createReadStream({ ...range, autoClose: false }), res);
         } finally { await file.handle.close(); }
         return;
       }
@@ -487,15 +654,20 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
       }
       if (route.startsWith('/api/')) {
         requireConnected();
+        if (req.method === 'GET' && route === '/api/plugins') return json(res, await plugins.read(projectFor(query.get('project')).path));
+        if (req.method === 'POST' && route === '/api/plugins') {
+          const input = await body(req);
+          return json(res, await plugins.update(projectFor(input.project).path, input));
+        }
         if (req.method === 'POST' && route === '/api/agents') return json(res, await agents.execute(await body(req)));
         const btwMatch = route.match(/^\/api\/btw\/([^/]+)(?:\/(open|send|stop|steer|steer-edit|steer-update|steer-cancel-edit|steer-remove|steer-send|queue|queue-remove|queue-run|queue-edit|queue-update))?$/);
         if (btwMatch) {
           const parentId = decodeURIComponent(btwMatch[1]);
-          if (req.method === 'GET' && !btwMatch[2]) return json(res, { ...await btw.snapshot(parentId, query.get('session')), eventSequence: sequence });
+          if (req.method === 'GET' && !btwMatch[2]) return json(res, { ...await btw.snapshot(parentId, query.get('session'), query.get('cursor')), eventSequence: sequence });
           if (req.method === 'POST') {
             const input = await body(req);
             if (btwMatch[2] === 'open') return json(res, { ...await btw.open(parentId), eventSequence: sequence });
-            if (btwMatch[2] === 'send') return json(res, await btw.send(parentId, input.text, input.sessionId));
+            if (btwMatch[2] === 'send') return json(res, await btw.send(parentId, input, input.sessionId));
             if (btwMatch[2] === 'stop') return json(res, await btw.stop(parentId, input.sessionId));
             if (btwMatch[2]?.startsWith('steer') || btwMatch[2]?.startsWith('queue')) return json(res, await btw.control(parentId, input.sessionId, btwMatch[2], input));
           }
@@ -522,18 +694,86 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
           const project = projectFor(input.project);
           const defaults = config.value;
           const result = await codex.request('thread/start', { cwd: project.path,
+            ...authorityParams(defaults.defaultAuthority),
             ...(defaults.defaultModel ? { model: defaults.defaultModel } : {}),
             config: { ...visualizationConfig(project.path, dataDir), ...(defaults.defaultEffort ? { model_reasoning_effort: defaults.defaultEffort } : {}) },
           });
+          if (defaults.defaultAuthority !== 'default') await authority.save(result.thread.id, defaults.defaultAuthority, authorityParams(defaults.defaultAuthority));
           loaded.add(result.thread.id);
           lifecycle.markLoaded(result.thread.id);
-          return json(res, result);
+          return json(res, { ...result, authority: authority.get(result.thread.id) });
         }
-        const match = route.match(/^\/api\/threads\/([^/]+)(?:\/(turns|send|stop|cleanup|children|steer|steer-edit|steer-update|steer-cancel-edit|steer-remove|steer-send|queue|queue-remove|queue-run|queue-edit|queue-update|compact|model|studycard))?$/);
+        const match = route.match(/^\/api\/threads\/([^/]+)(?:\/(turns|turn-count|fork|recover|send|stop|cleanup|children|steer|steer-edit|steer-update|steer-cancel-edit|steer-remove|steer-send|queue|queue-remove|queue-run|queue-edit|queue-update|compact|model|studycard))?$/);
         if (match) {
           const id = decodeURIComponent(match[1]);
           const action = match[2];
           if (btw.owns(id)) throw httpError(403, 'BTW 会话只能通过只读侧聊接口操作');
+          if (req.method === 'GET' && action === 'turn-count') {
+            const turns = await turnHistory.list(id);
+            return json(res, { count: turns.length, lastTurnId: turns.at(-1)?.id || null });
+          }
+          if (req.method === 'POST' && action === 'fork') return json(res, await forkThread(id, await body(req)));
+          if (req.method === 'POST' && action === 'recover') {
+            const input = await body(req);
+            const stopRevision = stopRevisions.get(id) || 0;
+            await editableThread(id);
+            if (!['retry', 'continue', 'edit', 'check', 'resend'].includes(input.action)) throw httpError(400, '恢复操作无效');
+            if (input.action === 'check') {
+              const pending = recovery.forThread(id).filter(entry => entry.state === 'unknown');
+              let cursor; const cursors = new Set();
+              do {
+                const page = await codex.request('thread/turns/list', { threadId: id, limit: 100, cursor, sortDirection: 'desc', itemsView: 'full' });
+                for (const turn of page.data) recovery.ingest(id, turn);
+                cursor = page.nextCursor;
+                if (cursor && cursors.has(cursor)) break;
+                cursors.add(cursor);
+              } while (cursor && pending.some(entry => entry.state === 'unknown'));
+              await recovery.file.flush();
+              return json(res, { recovery: recovery.snapshot(id) });
+            }
+            let payload, sourceTurnId = input.turnId || null, sourceLink = null;
+            if (input.recoveryId) {
+              const saved = recovery.records.get(input.recoveryId);
+              if (!saved || saved.threadId !== id) throw httpError(404, '恢复记录不存在');
+              if (saved.turnId) sourceTurnId = saved.turnId;
+              else {
+                if (!['unknown', 'rejected'].includes(saved.state)) throw httpError(409, '这条消息正在发送，请稍后检查结果');
+                if (input.action !== 'edit' && (input.action !== 'resend' || (saved.state === 'unknown' && input.confirmDuplicate !== true))) throw httpError(409, '发送结果尚未确认，请先检查历史');
+                payload = saved.input;
+                sourceLink = saved.sourceTurnId;
+              }
+            }
+            if (sourceTurnId) {
+              const { turn, latest } = await turnHistory.read(id, sourceTurnId);
+              payload = originalInput(id, turn);
+              if (input.action === 'edit') return json(res, { input: payload, latest });
+              const previous = recovery.records.get(input.actionId);
+              if (previous?.threadId === id && previous.sourceTurnId === sourceTurnId) {
+                if (previous.model !== (input.model || null) || (input.effort && previous.effort !== input.effort)) throw httpError(409, '恢复设置已变化，请重新发起操作');
+                if (recovery.running.has(input.actionId)) return json(res, await recovery.running.get(input.actionId));
+                if (previous.turnId) return json(res, { turn: { id: previous.turnId }, recovery: recovery.snapshot(id) });
+              }
+              if (recovery.forThread(id).some(entry => entry.sourceTurnId === sourceTurnId && entry.id !== input.actionId && !entry.supersededBy && ['preparing', 'dispatching', 'unknown'].includes(entry.state))) throw httpError(409, '已有一次恢复的发送结果待确认，请先检查发送结果');
+              if (!latest) throw httpError(409, '这轮之后已有新消息，请从这一轮分叉后继续');
+              if (!['failed', 'interrupted'].includes(turn.status)) throw httpError(409, '这一轮尚未失败或中断，请刷新会话');
+              const mode = recoveryMode(turn);
+              if (input.action !== mode) throw httpError(409, mode === 'continue' ? '本轮已有执行进展，请选择继续未完成任务' : '请重试这条消息');
+              if (mode === 'continue') payload = { ...payload, originalText: payload.text, text: `继续完成上一轮尚未完成的请求。先核对历史中的工具执行结果和当前状态，再完成剩余工作，避免重复已经完成的操作。\n\n原始请求：\n${payload.text}` };
+            }
+            if (!payload) throw httpError(400, '请指定要恢复的消息');
+            if (input.action === 'edit') return json(res, { input: payload, latest: true });
+            const actionId = operationId(input.actionId);
+            let model, effort;
+            if (input.model) {
+              const selected = (await models()).find(model => model.model === input.model);
+              if (!selected) throw httpError(400, '模型不在当前目录中，请重新选择');
+              model = selected.model; effort = input.effort || selected.defaultReasoningEffort;
+              if (effort && !selected.supportedReasoningEfforts?.some(option => option.reasoningEffort === effort)) throw httpError(400, '模型不支持所选推理强度');
+            }
+            if (lifecycle.cleaning.has(id)) await lifecycle.cleaning.get(id);
+            queue.pause(id);
+            return json(res, await startTurn(id, { ...payload, clientUserMessageId: actionId, sourceTurnId: sourceTurnId || sourceLink, sourceRecoveryId: input.recoveryId, model, effort, stopRevision }));
+          }
           if (action === 'studycard' && ['GET', 'POST'].includes(req.method)) {
             const metadata = await readThread(id);
             if (metadata.parentThreadId || metadata.canAcceptDirectInput === false) throw httpError(409, '子代理会话在这里仅供查看');
@@ -554,12 +794,18 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
             const effort = input.effort ?? model.defaultReasoningEffort;
             if (supported.length && !supported.some(option => option.reasoningEffort === effort)) throw httpError(400, '这个模型不支持所选 reasoning 强度');
             if (!supported.length && input.effort != null) throw httpError(400, '这个模型没有可选择的 reasoning 强度');
+            const permissionUpdate = input.authority === undefined ? null : await authority.params(input.authority, metadata.cwd, codex);
             await ensureLoaded(id);
             await codex.request('thread/settings/update', {
               threadId: id, model: model.model, ...(supported.length ? { effort } : {}),
+              ...(permissionUpdate || {}),
             });
+            if (permissionUpdate) {
+              await authority.save(id, input.authority, permissionUpdate, live.get(id).activeTurnId);
+              broadcast({ method: 'web/authority', params: { threadId: id, authority: input.authority, pending: Boolean(live.get(id).activeTurnId) } });
+            }
             const updated = await readThread(id);
-            return json(res, { thread: updated, appliesTo: 'nextTurn' });
+            return json(res, { thread: updated, authority: authority.get(id), appliesTo: 'nextTurn' });
           }
           if (req.method === 'GET' && !action) {
             const thread = await readThread(id);
@@ -569,12 +815,13 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
               if (!loaded.has(id) || live.get(id).turns.size) throw error;
               history = { data: [], nextCursor: null };
             }
-            history = { ...history, data: visualizationTurns(history.data) };
-            return json(res, { thread, history, eventSequence: sequence, live: live.snapshot(id), queue: queue.snapshot(id), steers: steers.snapshot(id), studycard: studycards.snapshot(id), approvals: [...codex.approvals.values()].filter(a => a.params.threadId === id) });
+            for (const turn of history.data) recovery.ingest(id, turn);
+            history = { ...history, data: visualizationTurns(history.data).map(turn => decorateTurn(id, turn)) };
+            return json(res, { thread, history, recovery: recovery.snapshot(id), eventSequence: sequence, live: live.snapshot(id), usage: usage.snapshot(id), authority: authority.get(id), pendingAuthority: authority.pending(id, live.get(id).activeTurnId), queue: queue.snapshot(id), steers: steers.snapshot(id), studycard: studycards.snapshot(id), approvals: [...codex.approvals.values()].filter(a => a.params.threadId === id) });
           }
           if (req.method === 'GET' && action === 'turns') {
             const result = await codex.request('thread/turns/list', { threadId: id, limit: 20, cursor: query.get('cursor'), sortDirection: 'desc', itemsView: 'full' });
-            return json(res, { ...result, data: visualizationTurns(result.data) });
+            return json(res, { ...result, data: visualizationTurns(result.data).map(turn => decorateTurn(id, turn)) });
           }
           if (req.method === 'GET' && action === 'children') {
             const result = await codex.request('thread/list', {
@@ -588,7 +835,7 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
           }
           if (req.method === 'POST' && action === 'send') {
             const input = await body(req);
-            return json(res, await startTurn(id, { text: input.text, skills: input.skills, images: input.images, files: input.files }));
+            return json(res, await startTurn(id, { text: input.text, skills: input.skills, images: input.images, files: input.files, clientUserMessageId: input.clientUserMessageId }));
           }
           if (req.method === 'POST' && action === 'steer') {
             const input = await body(req);
@@ -655,6 +902,7 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
           }
           if (req.method === 'POST' && action === 'stop') {
             await body(req);
+            stopRevisions.set(id, (stopRevisions.get(id) || 0) + 1);
             queue.pause(id);
             await lifecycle.clean(id, { stop: true });
             await queue.flush();
@@ -700,10 +948,28 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
       Object.assign(assets, {
         '/config.js': ['config.js', 'text/javascript'],
         '/config.css': ['config.css', 'text/css'],
+        '/plugins.js': ['plugins.js', 'text/javascript'],
+        '/quota.js': ['quota.js', 'text/javascript'],
+        '/terminal.js': ['terminal.js', 'text/javascript'],
+        '/terminal.css': ['terminal.css', 'text/css'],
+        '/vendor/xterm/xterm.js': ['vendor/xterm/xterm.js', 'text/javascript'],
+        '/vendor/xterm/addon-fit.js': ['vendor/xterm/addon-fit.js', 'text/javascript'],
+        '/vendor/xterm/xterm.css': ['vendor/xterm/xterm.css', 'text/css'],
+        '/plugins.css': ['plugins.css', 'text/css'],
         '/file-preview.html': ['file-preview.html', 'text/html'],
         '/file-preview.js': ['file-preview.js', 'text/javascript'],
         '/file-preview.css': ['file-preview.css', 'text/css'],
+        '/file-links.js': ['file-links.js', 'text/javascript'],
+        '/pdf-viewer.html': ['pdf-viewer.html', 'text/html'],
+        '/pdf-viewer.js': ['pdf-viewer.js', 'text/javascript'],
+        '/pdf-viewer.css': ['pdf-viewer.css', 'text/css'],
+        '/vendor/pdfjs/pdf.min.mjs': ['vendor/pdfjs/pdf.min.mjs', 'text/javascript'],
+        '/vendor/pdfjs/pdf.worker.min.mjs': ['vendor/pdfjs/pdf.worker.min.mjs', 'text/javascript'],
         '/markdown.js': ['markdown.js', 'text/javascript'],
+        '/mermaid.js': ['mermaid.js', 'text/javascript'],
+        '/mermaid-renderer.html': ['mermaid-renderer.html', 'text/html'],
+        '/mermaid-renderer.js': ['mermaid-renderer.js', 'text/javascript'],
+        '/vendor/mermaid/mermaid.min.js': ['vendor/mermaid/mermaid.min.js', 'text/javascript'],
         '/visualizations.js': ['visualizations.js', 'text/javascript'],
         '/visualizations.css': ['visualizations.css', 'text/css'],
         '/vendor/markdown-it.min.js': ['vendor/markdown-it.min.js', 'text/javascript'],
@@ -711,13 +977,32 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
         '/vendor/katex/katex.min.css': ['vendor/katex/katex.min.css', 'text/css'],
       });
       const font = route.match(/^\/vendor\/katex\/fonts\/(KaTeX_[A-Za-z0-9_-]+\.(woff2?|ttf))$/);
-      const asset = assets[route] || (font && [`vendor/katex/fonts/${font[1]}`, { woff2: 'font/woff2', woff: 'font/woff', ttf: 'font/ttf' }[font[2]]]);
+      const pdfAsset = route.match(/^\/vendor\/pdfjs\/(cmaps|standard_fonts|wasm)\/([A-Za-z0-9_-]+\.(bcmap|pfb|ttf|wasm|js))$/);
+      const asset = assets[route] || (font && [`vendor/katex/fonts/${font[1]}`, { woff2: 'font/woff2', woff: 'font/woff', ttf: 'font/ttf' }[font[2]]])
+        || (pdfAsset && [`vendor/pdfjs/${pdfAsset[1]}/${pdfAsset[2]}`, { ttf: 'font/ttf', wasm: 'application/wasm', js: 'text/javascript' }[pdfAsset[3]] || 'application/octet-stream']);
       if (req.method !== 'GET' || !asset) throw httpError(404, '页面不存在');
-      const data = await readFile(path.join(ROOT, 'public', asset[0]));
-      res.writeHead(200, { 'Content-Type': asset[1].startsWith('font/') ? asset[1] : `${asset[1]}; charset=utf-8`, 'Cache-Control': 'no-cache' });
+      if (route === '/mermaid-renderer.html') {
+        res.removeHeader('X-Frame-Options');
+        res.setHeader('Content-Security-Policy', "sandbox allow-scripts; default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src data:; font-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'");
+      }
+      // The reader is trusted app code; generated HTML keeps its separate sandbox.
+      if (route === '/pdf-viewer.html' || route.startsWith('/vendor/pdfjs/')) {
+        res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+        res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; style-src-attr 'unsafe-inline'; font-src 'self' data: blob:; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'");
+      }
+      let data = await readFile(path.join(ROOT, 'public', asset[0])).catch(error => { if (error.code === 'ENOENT') throw httpError(404, '页面不存在'); throw error; });
+      if (route === '/') {
+        const nonce = randomBytes(18).toString('base64');
+        data = Buffer.from(data.toString('utf8').replace('<head>', `<head>\n  <meta name="terminal-style-nonce" content="${nonce}">`));
+        res.setHeader('Content-Security-Policy', `${res.getHeader('Content-Security-Policy')}; style-src-elem 'self' 'nonce-${nonce}'`);
+      }
+      const textual = /^(text\/|application\/(javascript|json))/.test(asset[1]);
+      res.writeHead(200, { 'Content-Type': textual ? `${asset[1]}; charset=utf-8` : asset[1], 'Cache-Control': 'no-cache' });
       res.end(data);
     } catch (error) {
-      if (!res.headersSent) json(res, { error: error.message || '操作失败' }, error.status || 500);
+      if (!res.headersSent) json(res, { error: error.deliveryUnknown ? '发送结果待确认，请检查会话历史后再决定是否重发' : error.recoveryId && error.rpcRejected ? failureInfo(error).summary : error.message || '操作失败',
+        ...(error.retrySameOperation ? { retrySameOperation: true } : {}),
+        ...(error.recoveryId ? { recoveryId: error.recoveryId, deliveryUnknown: Boolean(error.deliveryUnknown) } : {}) }, error.status || 500);
       else res.end();
     }
   });
@@ -733,11 +1018,11 @@ export async function createApp({ codex, reload = prepareReload, dataDir = proce
     for (const res of clients) res.end();
     const httpClosed = new Promise(resolve => server.close(() => resolve()));
     server.closeAllConnections();
-    closePromise = Promise.all([codex.close(), httpClosed, studycards.close(), config.queue.catch(() => {}), queueClosed, agents.close()]).then(([result]) => result);
+    closePromise = Promise.all([codex.close(), httpClosed, studycards.close(), config.queue.catch(() => {}), queueClosed, agents.close(), usage.close(), authority.file.flush(), terminals.close(), recovery.file.flush(), turnHistory.file.flush()]).then(([result]) => result);
     return closePromise;
   }
   server.on('close', () => { void close(); });
-  return { agents, queue, btw, studycards, visualizations, server, codex, startup, live, lifecycle, close };
+  return { agents, queue, btw, studycards, visualizations, terminals, recovery, turnHistory, server, codex, startup, live, lifecycle, close };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -745,6 +1030,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 必须是 1–65535 的整数');
   const app = await createApp();
   app.server.on('error', error => { console.error(`启动失败：${error.message}`); void app.close(); process.exitCode = 1; });
-  app.server.listen(port, '127.0.0.1', () => console.log(`Codex Web 已启动：http://localhost:${port}\n仅供本机访问。保持此进程运行；Ctrl+C 停止服务。`));
+  app.server.listen(port, '127.0.0.1', () => console.log(`CodexWUI 已启动：http://localhost:${port}\n仅供本机访问。保持此进程运行；Ctrl+C 停止服务。`));
   installShutdownHandlers(app);
 }

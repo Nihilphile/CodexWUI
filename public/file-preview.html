@@ -14,7 +14,8 @@
   <header class="preview-toolbar">
     <div class="preview-heading"><h1 id="file-name">文件预览</h1><p id="file-path"></p></div>
     <nav aria-label="文件操作">
-      <button id="toggle-source" type="button" hidden>查看原文</button>
+      <button id="toggle-source" type="button" aria-pressed="true" hidden>渲染</button>
+      <a id="browser-file" target="_blank" rel="noopener noreferrer" hidden>浏览器打开 ↗</a>
       <a id="original-file" target="_blank" rel="noopener noreferrer" hidden>打开原文件 ↗</a>
       <a id="download-file" download hidden>下载</a>
     </nav>
@@ -26,6 +27,8 @@
   <script src="/vendor/markdown-it.min.js"></script>
   <script src="/vendor/katex/katex.min.js"></script>
   <script src="/markdown.js"></script>
+  <script src="/mermaid.js"></script>
+  <script src="/file-links.js"></script>
   <script src="/file-preview.js"></script>
 </body>
 </html>

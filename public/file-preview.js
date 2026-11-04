@@ -25,7 +25,13 @@ void (async () => {
     let source = Boolean(line);
     const renderText = () => {
       content.replaceChildren();
-      if (file.kind === 'markdown' && !source) {
+      if (['html', 'studycard'].includes(file.kind) && !source) {
+        const frame = document.createElement('iframe');
+        frame.className = 'preview-studycard'; frame.title = file.path;
+        frame.setAttribute('sandbox', 'allow-scripts'); frame.referrerPolicy = 'no-referrer';
+        frame.src = `/api/files/${file.kind === 'studycard' ? 'studycard' : 'html'}?${params}`;
+        content.append(frame);
+      } else if (file.kind === 'markdown' && !source) {
         content.innerHTML = window.CodexMarkdown(file.text, { project, directory });
         for (const heading of content.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
           heading.id = heading.textContent.trim().toLowerCase().replace(/[^\p{L}\p{N}_\s-]/gu, '').replace(/\s+/g, '-');
@@ -47,22 +53,26 @@ void (async () => {
         content.append(pre);
         content.querySelector('.selected')?.scrollIntoView?.({ block: 'center' });
       }
-      $('toggle-source').textContent = source ? '查看排版' : '查看原文';
-      $('toggle-source').setAttribute('aria-pressed', String(source));
+      $('toggle-source').setAttribute('aria-pressed', String(!source));
     };
-    if (file.kind === 'markdown' || file.kind === 'text') {
+    if (['markdown', 'text', 'html', 'studycard'].includes(file.kind)) {
       renderText();
-      if (file.kind === 'markdown') {
+      if (file.kind !== 'text') {
         $('toggle-source').hidden = false;
         $('toggle-source').onclick = () => { source = !source; renderText(); };
       }
+      if (['html', 'studycard'].includes(file.kind)) status.textContent += ' · 预览支持自包含 HTML；外部脚本、样式和相对资源不会加载。';
     } else if (file.kind === 'image') {
       const link = document.createElement('a'); link.href = original; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.className = 'preview-image-link';
       const image = document.createElement('img'); image.src = original; image.alt = file.path; image.className = 'preview-image';
       image.onerror = () => { status.textContent = '图片无法显示，可尝试下载原文件。'; status.classList.add('failed'); };
       link.append(image); content.append(link); status.textContent += ' · 点击图片打开原图';
     } else if (file.kind === 'pdf') {
-      status.textContent += ' · 点击“打开原文件”使用浏览器阅读 PDF，或下载查看。';
+      const frame = document.createElement('iframe'); frame.className = 'preview-pdf'; frame.title = 'PDF 阅读器';
+      frame.src = `/pdf-viewer.html?${params}`; content.append(frame);
+      $('browser-file').href = window.CodexFileLinks.browser(original + '&browser=1'); $('browser-file').hidden = false;
+      $('original-file').href = original + '&browser=1';
+      status.textContent += ' · 无法预览时，可用“浏览器打开”或下载查看。';
     } else status.textContent += ` · ${file.reason || '此类型暂不支持预览'}，可下载原文件。`;
   } catch (error) {
     status.textContent = `无法打开文件：${error.message}`;

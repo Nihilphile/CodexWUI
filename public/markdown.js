@@ -123,6 +123,16 @@
   md.renderer.rules.table_open = () => '<div class="table-scroll" role="region" aria-label="表格" tabindex="0"><table>\n';
   md.renderer.rules.table_close = () => '</table></div>\n';
 
+  const sourceLines = Symbol('sourceLines');
+  const fence = md.renderer.rules.fence;
+  md.renderer.rules.fence = (tokens, index, options, env, renderer) => {
+    const token = tokens[index];
+    const last = env[sourceLines]?.[token.map[1] - 1] || '';
+    const closed = new RegExp(`^[ >]*${token.markup[0]}{${token.markup.length},}\\s*$`).test(last);
+    if (token.info.trim().toLowerCase() !== 'mermaid' || !closed) return fence(tokens, index, options, env, renderer);
+    return `<codex-mermaid><div class="mermaid-output" role="region" aria-label="Mermaid 图表" tabindex="0"><p role="status">正在绘制图表…</p></div><details><summary>Mermaid 源码</summary><pre><code class="language-mermaid">${escape(token.content)}</code></pre></details></codex-mermaid>\n`;
+  };
+
   // Rendering the full history on every delta must not re-typeset old formulas.
   const cache = new Map();
   let size = 0;
@@ -130,7 +140,7 @@
     const source = String(text);
     const key = JSON.stringify([env.project, env.directory, source]);
     if (cache.has(key)) return cache.get(key);
-    const html = md.render(source, env);
+    const html = md.render(source, { ...env, [sourceLines]: source.split('\n') });
     const weight = key.length + html.length;
     if (weight <= 1024 * 1024) {
       while (cache.size && (size + weight > 1024 * 1024 || cache.size >= 100)) {

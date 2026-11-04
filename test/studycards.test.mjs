@@ -3,15 +3,18 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, realpath, symlink, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { JSDOM } from 'jsdom';
 import { StudyCards, STUDYCARD_STOP } from '../server/studycards.mjs';
+import { VisualizationStore } from '../server/visualizations.mjs';
 
 async function fixture(t) {
   const cwd = await realpath(await mkdtemp(path.join(tmpdir(), 'studycard-')));
   const dataDir = path.join(cwd, 'data'); await mkdir(dataDir);
-  const events = [], cards = new StudyCards({ dataDir, broadcast: message => events.push(structuredClone(message)) });
+  const visualizations = new VisualizationStore(path.join(dataDir, 'visualizations'));
+  const events = [], cards = new StudyCards({ dataDir, visualizations, broadcast: message => events.push(structuredClone(message)) });
   await cards.load();
   t.after(async () => { await cards.close(); await rm(cwd, { recursive: true, force: true }); });
-  return { cwd, dataDir, cards, events };
+  return { cwd, dataDir, cards, events, visualizations };
 }
 async function start(cards, cwd, id = 'a', turnId = 't1') {
   const capture = await cards.prepare(id, cwd);
@@ -40,7 +43,7 @@ test('switch is opt-in and per-thread; enabled prompts include fresh existing na
   assert.equal(await cards.prepare('b', cwd), null);
   complete(cards); await cards.close();
   assert.equal(await readFile(path.join(cwd, 'StudyCard/Python语法/容器/list.md'), 'utf8'), 'old');
-  assert.equal(await readFile(path.join(cwd, 'StudyCard/Python语法/容器/list-2.md'), 'utf8'), '# 列表\n完整解释。');
+  assert.match(await readFile(path.join(cwd, 'StudyCard/Python语法/容器/list-2.html'), 'utf8'), /<h1>列表<\/h1>\n<p>完整解释。<\/p>/);
 });
 
 test('stop keeps in-flight snapshot, persists across restart, and injects a closing notice once after acceptance', async t => {
@@ -69,28 +72,49 @@ test('stop keeps in-flight snapshot, persists across restart, and injects a clos
   await again.close();
 });
 
-test('only successful final replies are archived; commentary, partial replies, failed turns and ordinary chat are skipped', async t => {
+test('successful marked spans can start in any agent phase; failed turns, chat and quoted markers are skipped', async t => {
   const { cards, cwd } = await fixture(t);
   await cards.set('a', cwd, true);
-  for (const [i, options] of [{ phase: 'commentary' }, { phase: 'partial_answer' }, { status: 'interrupted' }, { status: 'failed' }, { text: '好的，继续。' }, { text: '说明\nStudyCard: Python/list\n不是首行。' }].entries()) {
+  for (const [i, options] of [{ status: 'interrupted' }, { status: 'failed' }, { text: '好的，继续。' }, { text: '```text\nStudyCard: Python/list\n```' }, { text: '> StudyCard: Python/list' }].entries()) {
     const turnId = 'skip-' + i;
     await start(cards, cwd, 'a', turnId); complete(cards, { ...options, turnId }); await cards.close();
   }
   assert.deepEqual(await readdir(path.join(cwd, 'StudyCard')), []);
   assert.deepEqual(cards.snapshot('a').results, []);
-  await start(cards, cwd, 'a', 'old-version');
-  complete(cards, { turnId: 'old-version', phase: null }); await cards.close();
-  assert.equal(cards.snapshot('a').results[0].status, 'saved', 'older protocols without phase use the last completed agent reply');
+  for (const [index, phase] of ['commentary', 'partial_answer', null].entries()) {
+    const turnId = 'phase-' + index;
+    await start(cards, cwd, 'a', turnId); complete(cards, { turnId, phase }); await cards.close();
+    assert.equal(cards.snapshot('a').results.at(-1).status, 'saved');
+  }
 });
 
-test('final answer beats unphased items and duplicate events do not write a second card', async t => {
+test('capture starts at the marker and preserves message/tool order and deduplicates completed items', async t => {
   const { cards, cwd } = await fixture(t);
   await cards.set('a', cwd, true); const capture = await start(cards, cwd);
-  cards.ingest({ method: 'item/completed', params: { threadId: 'a', turnId: 't1', item: { type: 'agentMessage', phase: 'final_answer', text: 'StudyCard: Python/list\r\n\r\n原文\r\n```python\r\nxs = []\r\n```' } } });
-  complete(cards, { text: 'StudyCard: 错误路径\n\n不要保存这个回退项', phase: null });
-  complete(cards); cards.accepted(capture, { id: 't1' }); await cards.close();
+  const item = (method, value) => cards.ingest({ method: 'item/' + method, params: { threadId: 'a', turnId: 't1', item: value } });
+  const before = { id: 'before', type: 'commandExecution', command: 'before marker' };
+  item('started', before);
+  const first = { id: 'first', type: 'agentMessage', phase: 'commentary', text: '不属于卡片的前言\r\nStudyCard: Python/list\r\n\r\n原文\r\n```python\r\nxs = []\r\n```' };
+  item('started', { ...first, text: '' });
+  cards.ingest({ method: 'item/agentMessage/delta', params: { threadId: 'a', turnId: 't1', itemId: 'first', delta: first.text.slice(0, 40) } });
+  cards.ingest({ method: 'item/agentMessage/delta', params: { threadId: 'a', turnId: 't1', itemId: 'first', delta: first.text.slice(40) } });
+  item('completed', first);
+  const tool = { id: 'tool', type: 'mcpToolCall', server: 'example', tool: 'calculate', arguments: { x: 2 }, result: { output: 4 } };
+  item('started', tool);
+  const tail = { id: 'tail', type: 'agentMessage', phase: 'final_answer', text: '尾部解释' };
+  item('started', tail); item('completed', tail); item('completed', tool); item('completed', before);
+  item('completed', { id: 'private', type: 'reasoning', text: '私有推理不归档' });
+  const terminal = { method: 'turn/completed', params: { threadId: 'a', turn: { id: 't1', status: 'completed', items: [before, first, tool, tail] } } };
+  cards.ingest(terminal); cards.ingest(terminal); cards.accepted(capture, { id: 't1' }); await cards.close();
   assert.equal(cards.snapshot('a').results.length, 1);
-  assert.equal(await readFile(path.join(cwd, 'StudyCard/Python/list.md'), 'utf8'), '原文\r\n```python\r\nxs = []\r\n```');
+  const html = await readFile(path.join(cwd, 'StudyCard/Python/list.html'), 'utf8');
+  const dom = new JSDOM(html); t.after(() => dom.window.close());
+  const main = dom.window.document.querySelector('main');
+  assert.deepEqual([...main.children].map(node => node.tagName), ['SECTION', 'DETAILS', 'SECTION']);
+  assert.match(main.querySelector('code').textContent, /xs = \[\]/);
+  assert.match(main.querySelector('details').textContent, /calculate/);
+  assert.equal(main.lastElementChild.textContent.trim(), '尾部解释');
+  assert.doesNotMatch(main.textContent, /不属于卡片的前言|before marker|私有推理|StudyCard:/);
   assert.deepEqual(await readdir(path.join(cwd, 'StudyCard')), ['Python']);
 });
 
@@ -101,15 +125,16 @@ test('concurrent conversations publish whole cards without overwriting each othe
   complete(cards, { text: 'StudyCard: Python/list\n\nfirst' });
   complete(cards, { id: 'b', turnId: 't2', text: 'StudyCard: Python/list\n\nsecond' }); await cards.close();
   const names = await readdir(path.join(cwd, 'StudyCard/Python'));
-  assert.deepEqual(names.sort(), ['list-2.md', 'list.md']);
+  assert.deepEqual(names.sort(), ['list-2.html', 'list.html']);
   const contents = await Promise.all(names.map(name => readFile(path.join(cwd, 'StudyCard/Python', name), 'utf8')));
-  assert.deepEqual(contents.sort(), ['first', 'second']);
+  assert.ok(contents.some(content => content.includes('<p>first</p>')));
+  assert.ok(contents.some(content => content.includes('<p>second</p>')));
 });
 
 test('malformed headers and escaping paths fail visibly; symlink directories cannot redirect host writes', async t => {
   const { cards, cwd } = await fixture(t);
   await cards.set('a', cwd, true);
-  for (const [i, header] of ['../../escape', '/absolute', 'Python//list', 'Python/../list', 'C:\\escape', 'Python/list.md', ''].entries()) {
+  for (const [i, header] of ['../../escape', '/absolute', 'Python//list', 'Python/../list', 'C:\\escape', 'Python/list.md', 'Python/list.html', ''].entries()) {
     const turnId = 'invalid-' + i;
     await start(cards, cwd, 'a', turnId);
     complete(cards, { turnId, text: `StudyCard: ${header}\n\ncontent` }); await cards.close();
@@ -120,6 +145,48 @@ test('malformed headers and escaping paths fail visibly; symlink directories can
   complete(cards, { turnId: 'symlink', text: 'StudyCard: outside/escape\n\ncontent' }); await cards.close();
   assert.equal(cards.snapshot('a').results.at(-1).status, 'error');
   assert.deepEqual((await readdir(cwd)).sort(), ['StudyCard', 'data']);
+});
+
+test('HTML cards embed complete visualization snapshots and archive-time state without server references', async t => {
+  const { cards, cwd, visualizations } = await fixture(t);
+  await writeFile(path.join(cwd, 'plot.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK1sAAAAASUVORK5CYII=', 'base64'));
+  const html = await visualizations.publish(cwd, { type: 'html', title: '列表模拟', content: '<!doctype html><button onclick="this.textContent=123">点击运行</button>' });
+  await visualizations.saveState(html.artifactId, { n: 4 });
+  const md = await visualizations.publish(cwd, { type: 'markdown', title: '公式', content: '# 原报告\n\n$x^2$\n\n<script>unsafe()</script>' });
+  const image = await visualizations.publish(cwd, { type: 'image', path: 'plot.png', title: '示意图' });
+  await rm(path.join(cwd, 'plot.png'));
+  await cards.set('a', cwd, true); await start(cards, cwd);
+  const send = item => cards.ingest({ method: 'item/completed', params: { threadId: 'a', turnId: 't1', item } });
+  send({ id: 'header', type: 'agentMessage', phase: 'commentary', text: 'StudyCard: Python/list' });
+  for (const artifact of [html, md, image]) send({ id: artifact.artifactId, type: 'mcpToolCall', server: 'codexwui_visualize', tool: 'visualize', status: 'completed', result: { structuredContent: artifact } });
+  complete(cards, { text: '这是可视化之后的完整解释。' }); await cards.close();
+  const result = cards.snapshot('a').results[0]; assert.equal(result.status, 'saved');
+  const source = await readFile(path.join(cwd, result.path), 'utf8');
+  const dom = new JSDOM(source); t.after(() => dom.window.close());
+  const main = dom.window.document.querySelector('main');
+  assert.deepEqual([...main.children].map(node => node.tagName), ['SECTION', 'SECTION', 'FIGURE', 'SECTION']);
+  const frame = main.querySelector('iframe');
+  assert.equal(frame.getAttribute('sandbox'), 'allow-scripts');
+  assert.match(frame.srcdoc, /点击运行/);
+  assert.match(frame.srcdoc, /window.codexVisualize/);
+  assert.deepEqual(JSON.parse(frame.dataset.state), { n: 4 });
+  assert.ok(main.querySelector('math'), 'formulas use native MathML without external fonts');
+  assert.equal(main.querySelector('.document script'), null);
+  assert.match(main.querySelector('img').src, /^data:image\/png;base64,/);
+  assert.equal(main.querySelector('details'), null, 'visualization protocol is replaced by published content');
+  assert.doesNotMatch(source, /\/api\/visualizations\//);
+  assert.match(main.textContent, /可视化之后的完整解释/);
+  await rm(visualizations.directory, { recursive: true });
+  assert.equal(await readFile(path.join(cwd, result.path), 'utf8'), source);
+});
+
+test('capture limit fails visibly instead of silently losing later messages', async t => {
+  const { cards, cwd } = await fixture(t);
+  await cards.set('a', cwd, true); await start(cards, cwd);
+  complete(cards, { text: 'StudyCard: Python/list\n\n' + 'x'.repeat(4 * 1024 * 1024) }); await cards.close();
+  assert.equal(cards.snapshot('a').results[0].status, 'error');
+  assert.match(cards.snapshot('a').results[0].error, /4 MiB/);
+  assert.deepEqual(await readdir(path.join(cwd, 'StudyCard')), []);
 });
 
 test('directory trees are bounded and replaced card roots are rejected', async t => {

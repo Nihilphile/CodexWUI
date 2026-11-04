@@ -9,9 +9,9 @@ import path from 'node:path';
 import { createApp } from '../server/index.mjs';
 import { CodexConnection } from '../server/codex.mjs';
 
-// Opt in with CODEXWEB_TEST_CODEX=codex-native. The real runtime talks only to
+// Opt in with CODEXWUI_TEST_CODEX=codex-native. The real runtime talks only to
 // this local Responses fixture, with an isolated CODEX_HOME and no account key.
-test('native BTW fork closes pending tool calls without interrupting its parent or generating on open', { skip: !process.env.CODEXWEB_TEST_CODEX, timeout: 60000 }, async t => {
+test('native BTW fork closes pending tool calls without interrupting its parent or generating on open', { skip: !process.env.CODEXWUI_TEST_CODEX, timeout: 60000 }, async t => {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'btw-native-')));
   const inputs = [];
   const mock = http.createServer(async (req, res) => {
@@ -51,7 +51,7 @@ skip_host_skill_discovery = true
 hooks = false
 goals = false
 `);
-  const connect = () => new CodexConnection({ binary: process.env.CODEXWEB_TEST_CODEX,
+  const connect = () => new CodexConnection({ binary: process.env.CODEXWUI_TEST_CODEX,
     spawnProcess: (command, args, options) => spawn(command, args, { ...options, env: { ...options.env, CODEX_HOME: directory } }),
   });
   const codex = connect();

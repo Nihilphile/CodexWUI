@@ -57,6 +57,6 @@ try {
   }
 } catch (error) {
   const uncertain = error.name === 'TimeoutError' || error.message === 'fetch failed';
-  console.error(JSON.stringify({ error: uncertain ? '服务不可达或请求超时。请检查 CodexWeb；操作可能已收件，先 observe，勿盲目重发。' : error.message }));
+  console.error(JSON.stringify({ error: uncertain ? '服务不可达或请求超时。请检查 CodexWUI；操作可能已收件，先 observe，勿盲目重发。' : error.message }));
   process.exitCode = 1;
 }

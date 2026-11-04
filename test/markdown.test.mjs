@@ -14,6 +14,17 @@ function fixture(t) {
   return { window: dom.window, root, render: text => { root.innerHTML = dom.window.CodexMarkdown(text); return root; } };
 }
 
+test('closed Mermaid fences become diagrams while incomplete streaming fences stay code', t => {
+  const { render } = fixture(t);
+  const root = render('```mermaid\nflowchart LR\n  A[开始] --> B[结束]\n```');
+  assert.ok(root.querySelector('codex-mermaid'), 'Mermaid is still displayed as an ordinary code block');
+  assert.match(root.querySelector('codex-mermaid code').textContent, /A\[开始\]/);
+  assert.equal(render('```mermaid\nflowchart LR\nA -->').querySelector('codex-mermaid'), null);
+  assert.equal(render('```js\nflowchart LR\nA --> B\n```').querySelector('codex-mermaid'), null);
+  assert.ok(render('> ~~~mermaid\n> sequenceDiagram\n> A->>B: 你好\n> ~~~').querySelector('blockquote codex-mermaid'));
+  assert.equal(render('```mermaid\n<script>alert(1)</script>\n```').querySelector('script'), null);
+});
+
 test('renders the screenshot table and orbital formulas as Markdown and accessible math', t => {
   const { render } = fixture(t);
   const root = render(String.raw`可以设计两个模式：

@@ -15,17 +15,19 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function fixture(t) {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'codex-visualizations-')));
   const root = path.join(directory, 'project'), dataDir = path.join(directory, 'data');
+  const cleanup = [];
   await mkdir(root);
   const store = new VisualizationStore(path.join(dataDir, 'visualizations'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  return { directory, root, store, dataDir };
+  // after hooks run in registration order: flush servers before removing files.
+  t.after(async () => { for (const close of cleanup) await close(); await rm(directory, { recursive: true, force: true }); });
+  return { directory, root, store, dataDir, cleanup };
 }
 async function server(t, options) {
   const codex = new FakeCodex(options.root);
   const app = await createApp({ codex, initialProject: options.root, dataDir: options.dataDir });
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening'); await app.startup;
   const base = `http://127.0.0.1:${app.server.address().port}`;
-  t.after(() => app.close());
+  options.cleanup.push(() => app.close());
   return { app, codex, base };
 }
 test('publishes HTML, Markdown and image snapshots that survive source changes and a fresh store', async t => {

@@ -1,10 +1,16 @@
 // Loaded before app.js. The panel owns its DOM and per-project reading state;
 // chat stream renders never replace the focused directory or raw-text viewer.
 window.CodexFilePanel = class {
-  constructor(root, { api, notify }) {
+  constructor(root, { api, notify, getUploadLimit = () => 100 * 1024 * 1024, onReload = null }) {
     this.root = root; this.api = api; this.notify = notify; this.projects = new Map(); this.project = null;
+    this.getUploadLimit = getUploadLimit; this.uploadBatch = null;
+    this.uploadAvailable = true; this.onReload = onReload;
+    this.uploadReloadMessage = '当前后端尚未加载工作区上传接口，请在本轮结束后执行 /reload，再重新选择文件。';
+    this.expandMode = 'panel'; this.expanded = false; root.dataset.expandMode = 'panel';
     root.innerHTML = `
       <div class="file-tabs" role="tablist" aria-label="打开的文件" aria-orientation="horizontal"></div>
+      <input type="file" data-file-upload-input aria-label="选择要上传到工作区的文件" multiple hidden>
+      <div class="file-upload-note" role="status" hidden><span></span><button type="button" data-file-upload-cancel hidden>取消上传</button><button type="button" data-file-upload-reload title="保存草稿并重载服务；运行中的任务将停止" hidden>重载服务</button></div>
       <div class="file-directory-pane" role="tabpanel" id="file-directory-pane" aria-labelledby="file-directory-tab">
         <div class="file-navigation"><button type="button" data-file-up aria-label="返回上级目录" title="返回上级 · ←">↑</button><nav class="file-breadcrumbs" aria-label="当前目录"></nav><button type="button" data-file-refresh-dir aria-label="刷新目录">↻</button></div>
         <div class="file-directory-note" role="status"></div>
@@ -12,12 +18,22 @@ window.CodexFilePanel = class {
         <div class="file-key-hint">↑ ↓ 选择 · → / Enter 打开 · ← 上级</div>
       </div>
       <div class="file-text-pane" role="tabpanel" id="file-text-pane" hidden>
-        <div class="file-toolbar"><button type="button" data-file-directory>← 目录</button><button type="button" data-file-wrap aria-pressed="true">自动换行</button><button type="button" data-file-copy>复制全文</button><button type="button" data-file-refresh-text aria-label="刷新文件">↻</button></div>
+        <div class="file-toolbar"><button type="button" data-file-directory>← 目录</button><button type="button" data-file-expand aria-expanded="false" aria-controls="file-text-pane" title="填满工作区面板">展开</button><button type="button" data-file-render data-file-card-source aria-pressed="false" hidden>渲染</button><button type="button" data-file-wrap aria-pressed="true">自动换行</button><button type="button" data-file-copy>复制全文</button><a data-file-browser target="_blank" rel="noopener noreferrer" hidden>浏览器打开 ↗</a><a data-file-download download hidden>下载</a><button type="button" data-file-refresh-text aria-label="刷新文件">↻</button></div>
         <div class="file-path"></div><div class="file-info"></div><div class="file-text-note" role="status"></div>
         <pre class="file-raw wrap" tabindex="0" role="region" aria-label="只读原始文本"></pre>
-        <div class="file-key-hint">只读原文 · Shift+Tab 返回标签栏</div>
+        <div class="file-markdown prose" tabindex="0" role="region" aria-label="Markdown 预览" hidden></div>
+        <iframe class="file-card-preview" title="HTML 预览" sandbox="allow-scripts" referrerpolicy="no-referrer" hidden></iframe>
+        <iframe class="file-pdf-preview" title="PDF 阅读器" referrerpolicy="no-referrer" hidden></iframe>
+        <img class="file-image-preview" alt="" hidden>
+        <div class="file-key-hint" data-file-reading-hint>只读原文 · Shift+Tab 返回标签栏</div>
       </div>`;
     this.tabs = root.querySelector('.file-tabs'); this.list = root.querySelector('.file-directory-list'); this.raw = root.querySelector('.file-raw');
+    const input = root.querySelector('[data-file-upload-input]');
+    input.onchange = () => {
+      const files = [...input.files], target = this.uploadTarget;
+      input.value = ''; this.uploadTarget = null;
+      if (files.length && target) void this.uploadFiles(files, target);
+    };
     this.tabs.addEventListener('keydown', event => this.tabKey(event));
     this.tabs.addEventListener('focusin', event => {
       if (event.target.matches('[data-file-tab]')) this.setTabFocus(event.target.dataset.fileTab, false);
@@ -29,20 +45,33 @@ window.CodexFilePanel = class {
       if (file) { file.top = this.raw.scrollTop; file.left = this.raw.scrollLeft; }
     });
     root.addEventListener('keydown', event => {
-      if (event.key === 'Tab' && event.shiftKey && !this.tabs.contains(event.target)) {
+      if (event.key === 'Tab' && event.shiftKey && !this.expanded && !this.tabs.contains(event.target)) {
         event.preventDefault(); this.setTabFocus(this.current?.active || '', true);
       }
     });
     root.addEventListener('click', event => {
       const button = event.target.closest('button');
       if (button?.disabled) return;
+      if (button?.hasAttribute('data-file-upload-reload')) { void this.onReload?.(); return; }
+      if (button?.hasAttribute('data-file-upload')) {
+        this.uploadTarget = { project: this.project, model: this.current, directory: this.current.dir };
+        input.value = ''; input.click(); return;
+      }
+      if (button?.hasAttribute('data-file-upload-cancel')) {
+        this.uploadBatch.cancelled = true; this.uploadRequest?.abort(); this.renderUpload(); return;
+      }
       if (button?.hasAttribute('data-file-close')) { this.closeFile(button.dataset.fileClose); return; }
       if (button?.hasAttribute('data-file-tab')) { this.activateTab(button.dataset.fileTab); return; }
       if (button?.hasAttribute('data-file-up')) { this.up(); return; }
       if (button?.hasAttribute('data-file-crumb')) { this.navigate(button.dataset.fileCrumb); return; }
       if (button?.hasAttribute('data-file-refresh-dir')) { this.navigate(this.current.dir); return; }
       if (button?.hasAttribute('data-file-directory')) { this.activateTab('', true); return; }
+      if (button?.hasAttribute('data-file-expand')) { this.expand(!this.expanded); return; }
       if (button?.hasAttribute('data-file-refresh-text')) { this.openFile(this.current.active, { refresh: true }); return; }
+      if (button?.hasAttribute('data-file-render')) {
+        this.savePosition();
+        const file = this.current.files.get(this.current.active); file.render = !file.render; this.renderFile(); return;
+      }
       if (button?.hasAttribute('data-file-wrap')) {
         const file = this.current.files.get(this.current.active); file.wrap = !file.wrap; this.renderFile(); return;
       }
@@ -50,11 +79,104 @@ window.CodexFilePanel = class {
       const row = event.target.closest('[data-file-entry]');
       if (row) { this.selectEntry(row.dataset.fileEntry); this.openSelected(); }
     });
+    root.ownerDocument.addEventListener('keydown', event => {
+      if (event.key !== 'Escape' || !this.expanded || root.ownerDocument.querySelector('dialog[open]')) return;
+      event.preventDefault(); this.expand(false); root.querySelector('[data-file-expand]').focus();
+    });
+  }
+  setUploadAvailable(available) { this.uploadAvailable = Boolean(available); this.renderUpload(); }
+  renderUpload() {
+    const limit = this.getUploadLimit(), batch = this.uploadBatch;
+    const button = this.root.querySelector('[data-file-upload]');
+    if (button) {
+      button.disabled = !this.uploadAvailable || !this.current || this.current.loading || Boolean(batch?.busy) || !limit;
+      button.title = !this.uploadAvailable ? this.uploadReloadMessage : this.project ? `上传到 ${this.project.name || '项目'}/${this.current.dir || ''} · 单个最多 ${limit / (1024 * 1024)} MiB` : '请先选择项目';
+    }
+    const note = this.root.querySelector('.file-upload-note'); note.hidden = !batch && this.uploadAvailable;
+    if (note.hidden) return;
+    if (batch) {
+      const target = `${batch.target.project.name || '项目'}/${batch.target.directory}`;
+      const progress = batch.percent === null ? '' : ` · ${batch.percent}%`;
+      note.querySelector('span').textContent = batch.busy
+        ? `${batch.cancelled ? '正在取消' : '上传至'} ${target} · ${batch.index}/${batch.total} · ${batch.name}${progress}`
+        : `${target} · 已上传 ${batch.completed.length} 个文件${batch.cancelled ? ' · 已取消后续上传' : ''}${batch.errors.length ? ` · ${batch.errors.join('；')}` : ''}`;
+    } else note.querySelector('span').textContent = this.uploadReloadMessage;
+    const cancel = note.querySelector('[data-file-upload-cancel]'); cancel.hidden = !batch?.busy; cancel.disabled = Boolean(batch?.cancelled);
+    note.querySelector('[data-file-upload-reload]').hidden = this.uploadAvailable || !this.onReload;
+    note.classList.toggle('failed', !this.uploadAvailable || Boolean(batch?.errors.length));
+  }
+  sendUpload(file, target, progress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new window.XMLHttpRequest(); this.uploadRequest = xhr;
+      xhr.open('POST', `/api/files/upload?${new URLSearchParams({ project: target.project.id, path: target.directory })}`);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+      xhr.upload.onprogress = event => progress(event.lengthComputable ? Math.round(event.loaded / event.total * 100) : null);
+      xhr.onload = () => {
+        let result;
+        try { result = JSON.parse(xhr.responseText); } catch { reject(new Error('上传失败，服务器响应无效')); return; }
+        if (xhr.status >= 200 && xhr.status < 300) resolve(result);
+        else if (xhr.status === 404 && result.error === '接口不存在') {
+          reject(Object.assign(new Error(this.uploadReloadMessage), { code: 'UPLOAD_RELOAD_REQUIRED' }));
+        } else reject(new Error(result.error || `上传失败 (${xhr.status})`));
+      };
+      xhr.onerror = () => reject(new Error('上传失败，请检查连接后重试'));
+      xhr.onabort = () => reject(new Error('已取消上传'));
+      xhr.onloadend = () => { if (this.uploadRequest === xhr) this.uploadRequest = null; };
+      xhr.send(file);
+    });
+  }
+  async uploadFiles(files, target) {
+    if (this.uploadBatch?.busy) return;
+    if (!this.uploadAvailable) { this.notify(this.uploadReloadMessage); return; }
+    const batch = { target, total: files.length, index: 0, name: '', percent: null, completed: [], errors: [], busy: true, cancelled: false };
+    this.uploadBatch = batch; this.renderUpload();
+    try {
+      for (const file of files) {
+        if (batch.cancelled) break;
+        batch.index++; batch.name = file.name; batch.percent = null; this.renderUpload();
+        const limit = this.getUploadLimit();
+        if (!limit || file.size > limit) { batch.errors.push(`${file.name}：${limit ? `超过 ${limit / (1024 * 1024)} MiB 上限` : '未读取到上传限制，请重试'}`); continue; }
+        try {
+          const result = await this.sendUpload(file, target, percent => { batch.percent = percent; this.renderUpload(); });
+          batch.completed.push(result);
+        } catch (error) {
+          if (!batch.cancelled) batch.errors.push(`${file.name}：${error.message}`);
+          if (error.code === 'UPLOAD_RELOAD_REQUIRED') { this.setUploadAvailable(false); break; }
+        }
+      }
+    } finally {
+      batch.busy = false; this.renderUpload();
+      if (batch.index) {
+        const directory = target.model.dirs.get(target.directory);
+        if (directory) directory.entries = null;
+        if (this.current === target.model && this.current.dir === target.directory && !this.current.active) {
+          await this.navigate(target.directory, { select: batch.completed.at(-1)?.path || null });
+        }
+      }
+      const renamed = batch.completed.filter(file => file.renamed).map(file => file.name);
+      this.notify(`已上传 ${batch.completed.length} 个文件至 ${target.project.name || '项目'}/${target.directory}${renamed.length ? ` · 同名文件保存为 ${renamed.join('、')}` : ''}${batch.errors.length ? ` · ${batch.errors.join('；')}` : batch.cancelled ? ' · 已取消后续上传' : ''}`);
+    }
+  }
+  setExpandMode(mode) {
+    this.expandMode = mode === 'fullscreen' ? 'fullscreen' : 'panel';
+    this.root.dataset.expandMode = this.expandMode;
+    this.expand(this.expanded);
+  }
+  expand(expanded) {
+    this.expanded = Boolean(expanded && this.current?.active);
+    this.root.classList.toggle('file-expanded', this.expanded);
+    this.root.closest('.inspector')?.classList.toggle('file-fullscreen-host', this.expanded && this.expandMode === 'fullscreen');
+    const button = this.root.querySelector('[data-file-expand]');
+    button.textContent = this.expanded ? '收起' : '展开';
+    button.setAttribute('aria-expanded', String(this.expanded));
+    button.title = this.expanded ? '恢复文件视图 · Esc' : this.expandMode === 'fullscreen' ? '全屏展开' : '填满工作区面板';
   }
   escape(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
   get current() { return this.project ? this.projects.get(this.project.id) : null; }
   setProject(project) {
     if (project?.id === this.project?.id) return;
+    this.expand(false);
     this.savePosition(); this.project = project || null;
     if (project && !this.projects.has(project.id)) this.projects.set(project.id, { dir: '', dirs: new Map(), files: new Map(), active: '', focusTab: '', navigation: 0, loading: false, error: '' });
     this.render();
@@ -66,7 +188,16 @@ window.CodexFilePanel = class {
   savePosition() {
     const m = this.current; if (!m) return;
     if (!m.active) this.directory().scroll = this.list.scrollTop;
-    else { const f = m.files.get(m.active); if (f) { f.top = this.raw.scrollTop; f.left = this.raw.scrollLeft; } }
+    else {
+      const f = m.files.get(m.active);
+      if (f) {
+        if (!this.raw.hidden) { f.top = this.raw.scrollTop; f.left = this.raw.scrollLeft; }
+        if (!this.root.querySelector('.file-markdown').hidden) f.renderTop = this.root.querySelector('.file-markdown').scrollTop;
+      }
+    }
+  }
+  readingTarget() {
+    return [...this.root.querySelectorAll('.file-raw,.file-markdown,iframe')].find(element => !element.hidden) || this.raw;
   }
   show() {
     if (!this.current) { this.render(); return; }
@@ -135,17 +266,24 @@ window.CodexFilePanel = class {
     if (!m.files.has(location)) m.files.set(location, { data: null, error: '', loading: false, wrap: true, top: 0, left: 0, version: 0 });
     const file = m.files.get(location);
     m.active = location; m.focusTab = location; this.render();
-    if (focus) this.raw.focus({ preventScroll: true });
+    if (focus) this.readingTarget().focus({ preventScroll: true });
     if (!refresh && (file.data || file.loading)) return;
     file.loading = true; file.error = ''; const version = ++file.version; this.renderFile();
     try {
-      const result = await this.api(`/api/files/read?project=${encodeURIComponent(project.id)}&path=${encodeURIComponent(location)}`);
-      if (file.version === version) file.data = result;
+      const result = await this.api(`/api/files/preview?project=${encodeURIComponent(project.id)}&path=${encodeURIComponent(location)}`);
+      if (file.version === version) {
+        file.data = result;
+        file.render ??= ['html', 'studycard'].includes(result.kind);
+      }
     } catch (error) { if (file.version === version) { file.error = error.message; file.data = null; } }
     finally {
       if (file.version === version) {
         file.loading = false;
-        if (this.current === m && m.active === location && m.files.get(location) === file) this.renderFile();
+        if (this.current === m && m.active === location && m.files.get(location) === file) {
+          const reading = this.root.ownerDocument.activeElement === this.raw;
+          this.renderFile();
+          if (reading) this.readingTarget().focus({ preventScroll: true });
+        }
       }
     }
   }
@@ -153,7 +291,7 @@ window.CodexFilePanel = class {
     const m = this.current; if (!m || (location && !m.files.has(location))) return;
     this.savePosition(); m.active = location; m.focusTab = location;
     this.render();
-    if (enter) (location ? this.raw : this.list).focus({ preventScroll: true });
+    if (enter) (location ? this.readingTarget() : this.list).focus({ preventScroll: true });
     else this.setTabFocus(location, true);
     if (!location && !this.directory().entries && !m.loading) this.navigate(m.dir, { focus: enter });
   }
@@ -186,13 +324,16 @@ window.CodexFilePanel = class {
   }
   render() {
     const m = this.current; const active = m?.active || ''; const escape = value => this.escape(value);
-    this.tabs.innerHTML = `<button type="button" id="file-directory-tab" role="tab" aria-controls="file-directory-pane" aria-selected="${!active}" tabindex="${!m?.focusTab ? 0 : -1}" data-file-tab="">目录</button>` + [...(m?.files.keys() || [])].map((location, i) => `<span class="file-tab-group"><button type="button" id="file-open-tab-${i}" role="tab" aria-controls="file-text-pane" aria-selected="${active === location}" tabindex="${m.focusTab === location ? 0 : -1}" data-file-tab="${escape(location)}" title="${escape(location)}">${escape(location.split('/').at(-1))}</button><button type="button" class="file-tab-close" tabindex="-1" data-file-close="${escape(location)}" aria-label="关闭 ${escape(location)}">×</button></span>`).join('');
+    if (!active) this.expand(false);
+    this.tabs.innerHTML = `<button type="button" id="file-directory-tab" role="tab" aria-controls="file-directory-pane" aria-selected="${!active}" tabindex="${!m?.focusTab ? 0 : -1}" data-file-tab="">目录</button><button type="button" class="file-upload-button" data-file-upload>↑ 上传文件</button>` + [...(m?.files.keys() || [])].map((location, i) => `<span class="file-tab-group"><button type="button" id="file-open-tab-${i}" role="tab" aria-controls="file-text-pane" aria-selected="${active === location}" tabindex="${m.focusTab === location ? 0 : -1}" data-file-tab="${escape(location)}" title="${escape(location)}">${escape(location.split('/').at(-1))}</button><button type="button" class="file-tab-close" tabindex="-1" data-file-close="${escape(location)}" aria-label="关闭 ${escape(location)}">×</button></span>`).join('');
     this.root.querySelector('.file-directory-pane').hidden = Boolean(active);
     this.root.querySelector('.file-text-pane').hidden = !active;
+    if (!active) for (const frame of this.root.querySelectorAll('iframe')) frame.removeAttribute('src');
     const activeTab = [...this.tabs.querySelectorAll('[data-file-tab]')].find(tab => tab.dataset.fileTab === active);
     if (activeTab && active) this.root.querySelector('.file-text-pane').setAttribute('aria-labelledby', activeTab.id);
     if (active) this.renderFile(); else this.renderDirectory();
     activeTab?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    this.renderUpload();
   }
   renderDirectory() {
     const m = this.current; if (m?.active) return;
@@ -214,23 +355,62 @@ window.CodexFilePanel = class {
     const selected = this.list.querySelector('[aria-selected="true"]');
     if (selected) this.list.setAttribute('aria-activedescendant', selected.id); else this.list.removeAttribute('aria-activedescendant');
     this.list.scrollTop = m ? this.directory().scroll : 0;
+    this.renderUpload();
   }
   renderFile() {
     const m = this.current; const file = m?.files.get(m.active); if (!file) return;
     const data = file.data;
+    const text = typeof data?.text === 'string';
+    const html = ['html', 'studycard'].includes(data?.kind);
+    const markdown = data?.kind === 'markdown';
+    const pdf = data?.kind === 'pdf';
+    const image = data?.kind === 'image';
+    const rendered = Boolean(file.render && (html || markdown));
+    const params = new URLSearchParams({ project: this.project.id, path: m.active });
+    const original = `/api/files/content?${params}`;
+    const frame = this.root.querySelector('.file-card-preview');
+    frame.hidden = !(html && rendered); this.raw.hidden = rendered || pdf || image;
+    if (html && rendered) {
+      const source = `/api/files/${data.kind === 'studycard' ? 'studycard' : 'html'}?${params}&v=${file.version}`;
+      if (frame.getAttribute('src') !== source) frame.setAttribute('src', source);
+    } else frame.removeAttribute('src');
+    const prose = this.root.querySelector('.file-markdown'); prose.hidden = !(markdown && rendered);
+    if (markdown && rendered) {
+      const key = JSON.stringify([this.project.id, m.active, file.version]);
+      if (prose.fileKey !== key || prose.fileData !== data) {
+        prose.innerHTML = window.CodexMarkdown(data.text, { project: this.project.id, directory: m.active.split('/').slice(0, -1).join('/') });
+        prose.fileKey = key;
+        prose.fileData = data;
+      }
+      prose.scrollTop = file.renderTop || 0;
+    }
+    const pdfFrame = this.root.querySelector('.file-pdf-preview'); pdfFrame.hidden = !pdf;
+    if (pdf) {
+      const src = `/pdf-viewer.html?${params}&v=${file.version}`;
+      if (pdfFrame.getAttribute('src') !== src) pdfFrame.setAttribute('src', src);
+    } else pdfFrame.removeAttribute('src');
+    const img = this.root.querySelector('.file-image-preview'); img.hidden = !image;
+    if (image) { img.src = original; img.alt = m.active; } else img.removeAttribute('src');
+    const browser = this.root.querySelector('[data-file-browser]'); browser.hidden = !pdf;
+    if (pdf) browser.href = window.CodexFileLinks.browser(original + '&browser=1'); else browser.removeAttribute('href');
+    const download = this.root.querySelector('[data-file-download]'); download.hidden = !data;
+    if (data) download.href = original + '&download=1'; else download.removeAttribute('href');
+    const toggle = this.root.querySelector('[data-file-render]'); toggle.hidden = !(html || markdown); toggle.disabled = file.loading;
+    toggle.setAttribute('aria-pressed', String(rendered));
     this.root.querySelector('.file-path').textContent = m.active;
-    this.root.querySelector('.file-info').textContent = data ? `${data.size.toLocaleString()} 字节 · ${new Date(data.modifiedAt).toLocaleString()}${data.kind === 'text' ? ' · UTF-8' : ''}` : '';
-    this.root.querySelector('.file-text-note').textContent = file.loading ? '正在读取文件…' : file.error || data?.reason || (data?.truncated ? '文件超过 1 MiB，仅显示开头部分；复制也仅包含预览内容。' : '');
-    this.raw.textContent = data?.kind === 'text' ? data.text : '';
+    this.root.querySelector('.file-info').textContent = data ? `${data.size.toLocaleString()} 字节 · ${new Date(data.modifiedAt).toLocaleString()}${text ? ' · UTF-8' : ''}` : '';
+    this.root.querySelector('.file-text-note').textContent = file.loading ? '正在读取文件…' : file.error || data?.reason || (data?.truncated ? (html && rendered ? '原文超过 1 MiB，复制仅包含开头部分；HTML 预览加载完整文件。' : '文件超过 1 MiB，仅显示开头部分；复制也仅包含预览内容。') : html && rendered ? '预览支持自包含 HTML；外部脚本、样式和相对资源不会加载。' : '');
+    this.raw.textContent = text ? data.text : '';
     this.raw.classList.toggle('wrap', file.wrap); this.raw.scrollTop = file.top; this.raw.scrollLeft = file.left;
     this.raw.setAttribute('aria-busy', String(file.loading));
-    const wrap = this.root.querySelector('[data-file-wrap]'); wrap.setAttribute('aria-pressed', String(file.wrap)); wrap.disabled = data?.kind !== 'text';
-    const copy = this.root.querySelector('[data-file-copy]'); copy.disabled = file.loading || data?.kind !== 'text'; copy.textContent = data?.truncated ? '复制预览' : '复制全文';
+    const wrap = this.root.querySelector('[data-file-wrap]'); wrap.setAttribute('aria-pressed', String(file.wrap)); wrap.disabled = !text || rendered; wrap.hidden = pdf || image;
+    const copy = this.root.querySelector('[data-file-copy]'); copy.disabled = file.loading || !text; copy.hidden = pdf || image; copy.textContent = data?.truncated ? '复制预览' : '复制全文';
+    this.root.querySelector('[data-file-reading-hint]').textContent = pdf ? 'PDF 阅读 · 可用“浏览器打开”交给浏览器查看' : rendered ? '只读预览 · 关闭“渲染”查看原文' : '只读原文 · Shift+Tab 返回标签栏';
     this.root.querySelector('[data-file-refresh-text]').disabled = file.loading;
   }
   async copy() {
     const data = this.current?.files.get(this.current.active)?.data;
-    if (data?.kind !== 'text') return;
+    if (typeof data?.text !== 'string') return;
     try { await navigator.clipboard.writeText(data.text); this.notify(data.truncated ? '已复制预览内容' : '已复制全文'); }
     catch { this.notify('浏览器未允许复制，请在文本区域选择后复制'); }
   }

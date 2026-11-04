@@ -23,9 +23,9 @@ const request = source => Object.assign(source, { headers: { 'x-file-name': enco
 test('file limit defaults to 100 MiB and validates configured values', () => {
   assert.equal(fileUploadLimit({}), 100 * 1024 * 1024);
   assert.equal(MAX_FILE_BYTES, fileUploadLimit({}));
-  assert.equal(fileUploadLimit({ CODEXWEB_MAX_FILE_MB: '500' }), 500 * 1024 * 1024);
+  assert.equal(fileUploadLimit({ CODEXWUI_MAX_FILE_MB: '500' }), 500 * 1024 * 1024);
   for (const value of ['', '0', '-1', '1.5', 'no', 'Infinity', String(Number.MAX_SAFE_INTEGER)]) {
-    assert.throws(() => fileUploadLimit({ CODEXWEB_MAX_FILE_MB: value }), /CODEXWEB_MAX_FILE_MB/);
+    assert.throws(() => fileUploadLimit({ CODEXWUI_MAX_FILE_MB: value }), /CODEXWUI_MAX_FILE_MB/);
   }
 });
 

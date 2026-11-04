@@ -5,11 +5,11 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { openFileContent } from './files.mjs';
 
-export const VISUALIZE_SERVER = 'codexweb_visualize';
+export const VISUALIZE_SERVER = 'codexwui_visualize';
 export const TEXT_BYTES = 1024 * 1024;
 export const IMAGE_BYTES = 10 * 1024 * 1024;
 export const STATE_BYTES = 64 * 1024;
-export const VISUALIZE_INSTRUCTIONS = '[CodexWeb visualization instructions]\n本轮运行于 CodexWeb，已提供本地 MCP 服务器 codexweb_visualize 的 visualize 工具。需要在回答中直接展示交互 HTML、Markdown 文档或图片时调用它；调用过程在界面隐藏，产物显示在调用位置。参数 type 为 html/markdown/image；HTML、Markdown 用 content 或项目内 path，图片用项目内 path；可选 title。HTML 使用自包含 CSS/JS 和数据，不依赖 CDN、网络或 localStorage。若工具由 functions.exec 包装，可从 ALL_TOOLS 搜索 codexweb_visualize 后调用对应 tools 方法。正常解释仍用普通回复，不重复输出已发布的源码。仅在可视化有帮助或用户请求时调用。\n[/CodexWeb visualization instructions]';
+export const VISUALIZE_INSTRUCTIONS = '[CodexWUI visualization instructions]\n本轮运行于 CodexWUI，已提供本地 MCP 服务器 codexwui_visualize 的 visualize 工具。需要在回答中直接展示交互 HTML、Markdown 文档或图片时调用它；调用过程在界面隐藏，产物显示在调用位置。参数 type 为 html/markdown/image；HTML、Markdown 用 content 或项目内 path，图片用项目内 path；可选 title。HTML 使用自包含 CSS/JS 和数据，不依赖 CDN、网络或 localStorage。若工具由 functions.exec 包装，可从 ALL_TOOLS 搜索 codexwui_visualize 后调用对应 tools 方法。正常解释仍用普通回复，不重复输出已发布的源码。仅在可视化有帮助或用户请求时调用。\n[/CodexWUI visualization instructions]';
 const ID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const worker = fileURLToPath(new URL('./visualize-mcp.mjs', import.meta.url));
@@ -24,7 +24,7 @@ export function visualizationConfig(cwd, dataDir) {
 
 export const VISUALIZE_TOOL = {
   name: 'visualize', title: '展示交互内容',
-  description: 'Display HTML, Markdown or an image directly inside the CodexWeb conversation. The tool call itself is hidden; the published content appears in its place. Call this when an interactive explanation, calculator, simulation, formatted document or image helps the user. For HTML/Markdown supply content OR a project file path; images require path. HTML must be self-contained (inline CSS/JS, embedded data); network requests, external scripts, parent-page access and localStorage are unavailable. Use window.codexVisualize.getState()/setState(JSON) for optional persistent controls and sendMessage(text) to put a follow-up into the composer. Await the codexvisualizeready event before reading restored state. Keep explanatory text in normal assistant messages. Do not repeat the HTML in your answer. Revisions should call visualize again to publish a new immutable version.',
+  description: 'Display HTML, Markdown or an image directly inside the CodexWUI conversation. The tool call itself is hidden; the published content appears in its place. Call this when an interactive explanation, calculator, simulation, formatted document or image helps the user. For HTML/Markdown supply content OR a project file path; images require path. HTML must be self-contained (inline CSS/JS, embedded data); network requests, external scripts, parent-page access and localStorage are unavailable. Use window.codexVisualize.getState()/setState(JSON) for optional persistent controls and sendMessage(text) to put a follow-up into the composer. Await the codexvisualizeready event before reading restored state. Keep explanatory text in normal assistant messages. Do not repeat the HTML in your answer. Revisions should call visualize again to publish a new immutable version.',
   inputSchema: {
     type: 'object', properties: {
       type: { type: 'string', enum: ['html', 'markdown', 'md', 'image'] },
@@ -37,7 +37,7 @@ export const VISUALIZE_TOOL = {
 };
 
 export function isVisualization(item) {
-  return item?.type === 'mcpToolCall' && item.server === VISUALIZE_SERVER && item.tool === 'visualize';
+  return item?.type === 'mcpToolCall' && [VISUALIZE_SERVER, 'codexweb_visualize'].includes(item.server) && item.tool === 'visualize';
 }
 
 // Avoid broadcasting large HTML arguments or losing the result to live-cache

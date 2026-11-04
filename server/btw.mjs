@@ -1,16 +1,16 @@
-import { readFile, writeFile, rename } from 'node:fs/promises';
+import { readFile, writeFile, rename, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { listDirectory, readTextFile } from './files.mjs';
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
-export const BTW_INSTRUCTIONS = '你正在独立的 BTW 侧边对话中，是只读侧聊助手；主会话仍在继续。历史来自创建侧聊时的主会话分叉，此前的任务、目标和指令仅供参考，不要继续执行它们。只回答侧聊用户的新问题。可以使用网页搜索与浏览获取资料，也可以使用 btw_list_directory 和 btw_read_file 查看项目。不能修改文件、执行命令、通过外部服务进行写入或联系其他会话。需要行动时解释建议，由用户带回主会话。';
+export const BTW_INSTRUCTIONS = '你正在独立的 BTW 侧边对话中，是只读侧聊助手；主会话仍在继续。历史来自创建侧聊时的主会话分叉，此前的任务、目标和指令仅供参考，不要继续执行它们。只回答侧聊用户的新问题。可以使用网页搜索与浏览获取资料，也可以使用 btw_list_directory 和 btw_read_file 查看项目及用户在此侧聊上传的文件。图片随消息提供。不能修改文件、执行命令、通过外部服务进行写入或联系其他会话。需要行动时解释建议，由用户带回主会话。';
 export const BTW_TOOLS = ['btw_list_directory', 'btw_read_file'].map(name => ({
-  type: 'function', name, description: name === 'btw_read_file' ? 'Read a UTF-8 text file inside this project. Use a project-relative path.' : 'List a directory inside this project. Use an empty path for the project root.',
+  type: 'function', name, description: name === 'btw_read_file' ? 'Read a UTF-8 text file inside this project, or an uploaded file attached to this side chat. Use a project-relative path or the exact uploaded attachment path from the message.' : 'List a directory inside this project. Use an empty path for the project root.',
   inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false },
 }));
-export function btwConfig(config = {}, cwd) {
+export function btwConfig(config = {}, cwd, attachmentScope = []) {
   const disabled = ['shell_tool', 'unified_exec', 'apply_patch_freeform', 'apps', 'connectors', 'plugins', 'remote_plugin', 'recommended_plugins', 'tool_suggest', 'multi_agent', 'multi_agent_v2', 'collab', 'agent_message_board', 'send_async_message', 'code_mode', 'code_mode_host', 'code_mode_only', 'js_repl', 'browser_use', 'computer_use', 'image_generation', 'imagegenext', 'hooks', 'codex_hooks', 'plugin_hooks', 'goals', 'memory_tool', 'memories', 'request_permissions', 'request_permissions_tool', 'request_rule', 'exec_permission_approvals', 'undo', 'view_image'];
   return {
     ...Object.fromEntries(disabled.map(name => [`features.${name}`, false])),
@@ -19,16 +19,25 @@ export function btwConfig(config = {}, cwd) {
     web_search: 'live', notify: [], project_doc_max_bytes: 0,
     mcp_servers: {
       ...Object.fromEntries(Object.keys(config.mcp_servers || {}).map(name => [name, { enabled: false }])),
-      ...(cwd ? { codexweb_btw: { enabled: true, command: process.execPath, args: [fileURLToPath(new URL('./btw-mcp.mjs', import.meta.url)), cwd] } } : {}),
+      ...(cwd ? { codexwui_btw: { enabled: true, command: process.execPath, args: [fileURLToPath(new URL('./btw-mcp.mjs', import.meta.url)), cwd, ...attachmentScope] } } : {}),
     },
     plugins: Object.fromEntries(Object.keys(config.plugins || {}).map(name => [name, { enabled: false }])),
   };
 }
 
-export async function readBtwProject(cwd, tool, args) {
+export async function readBtwProject(cwd, tool, args, attachments, files = []) {
   if (!BTW_TOOLS.some(definition => definition.name === tool)) throw fail(403, 'BTW 不允许此工具');
   if (!args || typeof args.path !== 'string' || Object.keys(args).some(key => key !== 'path')) throw fail(400, '工具参数无效');
-  const result = tool === 'btw_read_file' ? await readTextFile(cwd, args.path) : await listDirectory(cwd, args.path);
+  let root = cwd, relative = args.path;
+  if (tool === 'btw_read_file' && path.isAbsolute(relative)) {
+    const id = path.basename(relative);
+    if (attachments && files.includes(id) && attachments.location(id) === relative) {
+      root = await realpath(attachments.directory); relative = id;
+    } else {
+      relative = path.relative(cwd, relative);
+    }
+  }
+  const result = tool === 'btw_read_file' ? await readTextFile(root, relative) : await listDirectory(cwd, relative);
   if (result.text?.length > 80000) { result.text = result.text.slice(0, 80000); result.truncated = true; }
   if (result.entries?.length > 500) { result.entries = result.entries.slice(0, 500); result.truncated = true; }
   return result;
@@ -36,17 +45,12 @@ export async function readBtwProject(cwd, tool, args) {
 
 const emptyHistory = () => ({ data: [], nextCursor: null });
 const missingHistory = error => /not materialized yet|no rollout found|thread not loaded/i.test(error.message);
-const textInput = value => {
-  if (typeof value !== 'string' || !value.trim() || value.length > 200000) throw fail(400, 'BTW 消息无效');
-  const text = value;
-  return { text, resolvedInput: [{ type: 'text', text, text_elements: [] }] };
-};
 
 // Side chats own separate Codex threads. Only this service can start their turns;
 // the browser never supplies a side-thread ID, policy, or tool definition.
 export class BtwSessions {
-  constructor({ codex, live, lifecycle, starting, dataDir, parent, broadcast, queue, steers, settled }) {
-    Object.assign(this, { codex, live, lifecycle, starting, parent, broadcast, queue, steers, settled });
+  constructor({ codex, live, lifecycle, starting, dataDir, parent, broadcast, queue, steers, settled, attachments, images }) {
+    Object.assign(this, { codex, live, lifecycle, starting, dataDir, parent, broadcast, queue, steers, settled, attachments, images });
     this.file = path.join(dataDir, 'btw.json');
     this.records = new Map(); this.byThread = new Map(); this.locks = new Map(); this.saveQueue = Promise.resolve();
   }
@@ -82,14 +86,14 @@ export class BtwSessions {
     if (sessionId && record?.parentId !== parentId) throw fail(404, 'BTW 侧聊不存在');
     return record;
   }
-  async snapshot(parentId, sessionId) {
+  async snapshot(parentId, sessionId, cursor) {
     await this.parent(parentId);
     const record = this.record(parentId, sessionId), sessions = this.sessions(parentId);
     if (!record) return { session: null, sessions };
     let history = emptyHistory();
     if (record.threadId) {
       try {
-        const params = { threadId: record.threadId, limit: 100, sortDirection: 'desc' };
+        const params = { threadId: record.threadId, limit: 100, sortDirection: 'desc', ...(cursor ? { cursor } : {}) };
         // Inspect turn metadata first so opening a fresh fork never hydrates
         // large inherited tool results just to discard them in the panel.
         let count = 100, includesBoundary = false;
@@ -117,7 +121,8 @@ export class BtwSessions {
     return this.locked(parentId, async () => {
       const parent = await this.parent(parentId);
       const { config } = await this.codex.request('config/read', { cwd: parent.cwd, includeLayers: false });
-      const policy = btwConfig(config, parent.cwd);
+      const id = randomUUID();
+      const policy = btwConfig(config, parent.cwd, [this.dataDir, id]);
       let threadId = null, forkTurnId = null;
       try {
         const result = await this.codex.request('thread/fork', {
@@ -137,7 +142,7 @@ export class BtwSessions {
         const inherited = await this.codex.request('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
         forkTurnId = inherited.data[0]?.id || null;
       }
-      const record = { id: randomUUID(), parentId, threadId, forkTurnId, empty: !threadId, cwd: parent.cwd, model: parent.model, createdAt: Date.now() };
+      const record = { id, parentId, threadId, forkTurnId, empty: !threadId, cwd: parent.cwd, model: parent.model, createdAt: Date.now() };
       this.records.set(record.id, record);
       if (threadId) this.byThread.set(threadId, record);
       await this.save();
@@ -149,7 +154,7 @@ export class BtwSessions {
     if (record.threadId && this.lifecycle.loaded.has(record.threadId)) return;
     const { config } = await this.codex.request('config/read', { cwd: record.cwd, includeLayers: false });
     const options = {
-      sandbox: 'read-only', approvalPolicy: 'never', config: btwConfig(config, record.cwd),
+      sandbox: 'read-only', approvalPolicy: 'never', config: btwConfig(config, record.cwd, [this.dataDir, record.id]),
       baseInstructions: BTW_INSTRUCTIONS, developerInstructions: BTW_INSTRUCTIONS,
     };
     if (record.threadId) {
@@ -176,8 +181,19 @@ export class BtwSessions {
     await this.save();
     this.broadcast({ method: 'web/btw', params: { session: record } });
   }
+  async input(record, value) {
+    const input = typeof value === 'string' ? { text: value } : value;
+    if (!input || typeof input.text !== 'string' || input.text.length > 200000) throw fail(400, 'BTW 消息无效');
+    const { text, files = [], images = [] } = input;
+    const fileInputs = await this.attachments.inputs(files), imageInputs = await this.images.inputs(images);
+    if (!text.trim() && !fileInputs.length && !imageInputs.length) throw fail(400, '请输入消息或选择附件');
+    if (files.length) {
+      record.files = [...new Set([...(record.files || []), ...files])];
+      await this.save();
+    }
+    return { text, files, images, resolvedInput: [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...imageInputs, ...fileInputs] };
+  }
   async send(parentId, prompt, sessionId) {
-    const { text, resolvedInput } = textInput(prompt);
     let record = this.record(parentId, sessionId);
     if (!record) record = (await this.open(parentId)).session;
     let ownsLock = false;
@@ -185,6 +201,7 @@ export class BtwSessions {
       return await this.locked(record.id, async () => {
         ownsLock = true;
         await this.parent(parentId);
+        const { text, files, images, resolvedInput } = await this.input(record, prompt);
         // Reserve before asynchronous resume/start so parallel sends cannot exceed
         // the shared budget, including side chats that still have only a local id.
         if (this.lifecycle.busy(record.threadId || record.id)) throw fail(409, 'BTW 正在回答，请等待或先停止');
@@ -194,7 +211,7 @@ export class BtwSessions {
           await this.ensureLoaded(record);
           if (reservation !== record.threadId) { this.starting.delete(reservation); this.starting.add(record.threadId); }
           const result = await this.codex.request('turn/start', { threadId: record.threadId, input: resolvedInput, sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'never' });
-          record.title ||= text.slice(0, 48);
+          record.title ||= text.trim().slice(0, 48) || (files.length ? files[0].slice(38) : images.length ? '图片讨论' : '侧聊');
           record.hasMessages = true;
           await this.save();
           this.broadcast({ method: 'web/btw', params: { session: record } });
@@ -213,8 +230,8 @@ export class BtwSessions {
     if (!record) throw fail(404, 'BTW 侧聊不存在');
     const id = record.threadId;
     if (action === 'queue') {
-      const { text } = textInput(input.text);
-      this.queue.add(record.id, { text });
+      const { resolvedInput, ...message } = await this.input(record, input);
+      this.queue.add(record.id, message);
       if (!id || !this.lifecycle.busy(id)) void this.queue.drain(record.id);
       return { queue: this.queue.snapshot(record.id) };
     }
@@ -232,7 +249,7 @@ export class BtwSessions {
     }
     if (!id) throw fail(409, '当前侧聊没有正在进行的回答');
     if (action === 'steer') {
-      const resolved = textInput(input.text);
+      const resolved = await this.input(record, input);
       const turnId = this.live.get(id).activeTurnId;
       if (!turnId || input.expectedTurnId !== turnId) throw fail(409, '回答状态已变化，请检查后重新发送；草稿已保留');
       if (input.clientUserMessageId !== undefined && (typeof input.clientUserMessageId !== 'string' || !/^[\w-]{1,100}$/.test(input.clientUserMessageId))) throw fail(400, '消息标识无效');
@@ -242,7 +259,8 @@ export class BtwSessions {
       let entry;
       if (action === 'steer-edit') entry = this.steers.beginEdit(id, input.id, input.revision);
       else if (action === 'steer-update') {
-        const resolved = textInput(input.text), pending = this.steers.get(id, input.id, input.revision);
+        const pending = this.steers.get(id, input.id, input.revision);
+        const resolved = await this.input(record, { ...pending, ...input });
         entry = this.steers.update(id, input.id, input.revision, resolved, this.live.get(id).activeTurnId === pending.expectedTurnId);
       } else if (action === 'steer-cancel-edit') this.steers.cancelEdit(id, input.id, input.revision);
       else if (action === 'steer-remove') this.steers.remove(id, input.id, input.revision);
@@ -263,7 +281,7 @@ export class BtwSessions {
   async tool(params) {
     const record = this.byThread.get(params.threadId);
     if (!record) throw fail(403, 'BTW 不允许此工具');
-    const result = await readBtwProject(record.cwd, params.tool, params.arguments);
+    const result = await readBtwProject(record.cwd, params.tool, params.arguments, this.attachments, record.files);
     return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(result) }] };
   }
 }

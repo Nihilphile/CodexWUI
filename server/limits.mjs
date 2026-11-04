@@ -1,3 +1,5 @@
+import { appEnv } from './environment.mjs';
+
 function positive(value, fallback, name) {
   const number = value === undefined ? fallback : Number(value);
   if (!Number.isSafeInteger(number) || number < 1) throw new Error(`${name} 必须是正整数`);
@@ -6,10 +8,10 @@ function positive(value, fallback, name) {
 
 export function resourceLimits(env = process.env) {
   return {
-    maxProcesses: positive(env.CODEXWEB_MAX_PROCESSES, 48, 'CODEXWEB_MAX_PROCESSES'),
-    maxRssMb: positive(env.CODEXWEB_MAX_RSS_MB, 4096, 'CODEXWEB_MAX_RSS_MB'),
-    maxActiveTurns: positive(env.CODEXWEB_MAX_ACTIVE_TURNS, 2, 'CODEXWEB_MAX_ACTIVE_TURNS'),
-    idleMs: positive(env.CODEXWEB_IDLE_MINUTES, 5, 'CODEXWEB_IDLE_MINUTES') * 60000,
+    maxProcesses: positive(appEnv(env, 'MAX_PROCESSES'), 48, 'CODEXWUI_MAX_PROCESSES'),
+    maxRssMb: positive(appEnv(env, 'MAX_RSS_MB'), 4096, 'CODEXWUI_MAX_RSS_MB'),
+    maxActiveTurns: positive(appEnv(env, 'MAX_ACTIVE_TURNS'), 2, 'CODEXWUI_MAX_ACTIVE_TURNS'),
+    idleMs: positive(appEnv(env, 'IDLE_MINUTES'), 5, 'CODEXWUI_IDLE_MINUTES') * 60000,
   };
 }
 

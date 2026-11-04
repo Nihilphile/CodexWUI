@@ -5,27 +5,35 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#141917">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <title>Codex · 本地工作台</title>
+  <title>CodexWUI · 本地工作台</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/styles.css">
   <link rel="stylesheet" href="/visualizations.css">
   <link rel="stylesheet" href="/config.css">
+  <link rel="stylesheet" href="/plugins.css">
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css">
+  <link rel="stylesheet" href="/terminal.css">
   <script src="/vendor/markdown-it.min.js"></script>
   <script src="/vendor/katex/katex.min.js"></script>
   <script src="/markdown.js"></script>
+  <script src="/mermaid.js"></script>
   <script src="/visualizations.js"></script>
+  <script src="/file-links.js"></script>
   <script src="/files.js"></script>
   <script src="/btw.js"></script>
   <script src="/reload.js"></script>
   <script src="/config.js"></script>
+  <script src="/plugins.js"></script>
+  <script src="/quota.js"></script>
+  <script src="/terminal.js"></script>
   <script type="module" src="/app.js"></script>
 </head>
 <body>
   <div id="scrim" class="scrim" hidden></div>
   <aside id="sidebar" class="sidebar">
-    <div class="brand"><span class="brand-icon">⌘</span><strong>codex<span class="brand-sub"> / local</span></strong><button id="close-sidebar" class="icon-button mobile-only" aria-label="关闭会话列表">×</button></div>
+    <div class="brand"><span class="brand-icon">⌘</span><strong>CodexWUI<span class="brand-sub"> / local</span></strong><button id="close-sidebar" class="icon-button" aria-label="收起会话列表" title="收起会话列表" aria-controls="sidebar">‹</button></div>
     <div class="section-label">工作空间 <button id="add-project" class="small-button" title="添加项目目录">＋ 添加</button></div>
     <label class="sr-only" for="project-select">当前项目</label>
     <select id="project-select" aria-label="当前项目"></select>
@@ -36,17 +44,17 @@
     <input id="thread-search" class="thread-search" placeholder="筛选会话…" type="search">
     <nav id="thread-list" class="thread-list" aria-label="历史会话"></nav>
     <button id="more-threads" class="text-button" hidden>加载更多会话</button>
-    <footer class="sidebar-footer"><span id="connection-dot" class="status-dot"></span><span id="connection-label">正在连接</span><span id="memory-usage" class="memory-usage" title="Codex Web 及工具进程的合计内存（RSS）">RAM --/--G</span><span class="local-pill">LOCALHOST</span></footer>
+    <footer class="sidebar-footer"><span id="connection-dot" class="status-dot"></span><span id="connection-label">正在连接</span><span id="memory-usage" class="memory-usage" title="CodexWUI 及工具进程的合计内存（RSS）">RAM --/--G</span><button id="account-quota" class="quota-pill" type="button" aria-haspopup="dialog" aria-controls="quota-dialog">额度 --</button></footer>
   </aside>
   <main class="workspace">
     <header class="workspace-header">
-      <button id="open-sidebar" class="icon-button mobile-only" aria-label="打开项目与会话">☰</button>
+      <button id="open-sidebar" class="icon-button" aria-label="展开或收起会话列表" title="展开或收起会话列表" aria-controls="sidebar" aria-expanded="true">☰</button>
       <div class="thread-heading"><div id="breadcrumb" class="breadcrumb">本地工作台</div><h1 id="thread-title">开始一段新的工作</h1></div>
       <span id="thread-status" class="state-pill">就绪</span>
       <button id="open-config" type="button" class="icon-button" aria-label="打开全局设置" title="全局设置 · /config">⚙</button>
-      <button id="toggle-inspector" class="icon-button" aria-label="打开右侧面板" title="文件、子代理与改动">◫</button>
+      <button id="toggle-inspector" class="icon-button" aria-label="打开右侧面板" title="文件、终端、子代理与改动" aria-controls="inspector" aria-expanded="false">◫</button>
     </header>
-    <div class="view-bar"><div class="conversation-controls"><span class="conversation-label">会话 <span id="agent-summary"></span></span><button id="back-parent" class="back-parent" type="button" hidden>← 返回父会话</button></div><button id="model-label" class="model-label" type="button" title="选择模型和 reasoning · /model">使用本机配置 ▾</button></div>
+    <div class="view-bar"><div class="conversation-controls"><span class="conversation-label">会话<span id="turn-count"></span> <span id="agent-summary"></span></span><button id="back-parent" class="back-parent" type="button" hidden>← 返回父会话</button></div><button id="model-label" class="model-label" type="button" title="Model / Reasoning / Authority · /model">默认 / 默认 / 默认 ▾</button></div>
     <div id="parallel-note" class="parallel-note" hidden></div>
     <div id="connection-banner" class="connection-banner" hidden></div>
     <section id="chat-view" class="view chat-view">
@@ -57,6 +65,7 @@
       <div id="approval-list" class="approval-list"></div>
       <div id="steer-list" class="steer-list" aria-label="待接收引导" aria-live="polite"></div>
       <div id="queue-list" class="queue-list"></div>
+      <div id="context-strip" class="context-strip" hidden><span id="context-status" role="status"></span><button id="context-usage" type="button" aria-haspopup="dialog" aria-controls="usage-dialog"><span class="context-track" aria-hidden="true"><span id="context-fill"></span></span><span id="context-label">上下文 —</span><span aria-hidden="true">⌃</span></button></div>
       <form id="composer" class="composer">
         <div id="readonly-note" class="readonly-note" hidden>子代理会话仅供查看，由父会话协调任务。</div>
         <label class="sr-only" for="prompt">发送给 Codex 的消息</label>
@@ -67,7 +76,7 @@
         <!-- Explicit document types avoid the media-only chooser shown by some Android browsers. -->
         <input id="file-input" type="file" accept=".pdf,.txt,.md,.csv,.json,.jsonl,.xml,.yaml,.yml,.log,.html,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.sh,.c,.h,.cpp,.java,.go,.rs,.sql,.toml,.ini,.conf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.7z,.rar,.tar,.gz,.epub,application/pdf,text/plain,text/csv,application/json,application/zip,application/octet-stream,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation" multiple hidden>
         <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
-        <div class="composer-footer"><button id="command-menu" type="button" class="composer-tool" title="斜杠命令">/</button><button id="skill-menu" type="button" class="composer-tool" title="选择技能">$</button><button id="attach-image" type="button" class="composer-tool" aria-label="添加图片" title="添加图片 · PNG / JPEG / WebP · 单张最多 10 MiB">▧</button><button id="attach-file" type="button" class="composer-tool" aria-label="添加文件" title="添加文件 · 正在读取上传限制" disabled>📎</button><span id="composer-hint">沿用 Codex 权限配置</span><select id="send-mode" aria-label="运行中发送方式" hidden><option value="steer">引导 · Steer</option><option value="queue">排队 · Follow-up</option></select><button id="stop-turn" type="button" class="stop-button" hidden>■</button><button id="send" class="send-button" type="submit" aria-label="发送消息">发送 ↑</button></div>
+        <div class="composer-footer"><button id="command-menu" type="button" class="composer-tool" title="打开命令菜单，保留草稿" aria-label="打开命令菜单" aria-controls="suggestions" aria-expanded="false">/</button><button id="skill-menu" type="button" class="composer-tool" title="选择技能">$</button><button id="attach-image" type="button" class="composer-tool" aria-label="添加图片" title="添加图片 · PNG / JPEG / WebP · 单张最多 10 MiB">▧</button><button id="attach-file" type="button" class="composer-tool" aria-label="添加文件" title="添加文件 · 正在读取上传限制" disabled>📎</button><span class="composer-spacer" aria-hidden="true"></span><select id="send-mode" aria-label="运行中发送方式" hidden><option value="steer">引导 · Steer</option><option value="queue">排队 · Follow-up</option></select><button id="stop-turn" type="button" class="stop-button" hidden>■</button><button id="send" class="send-button" type="submit" aria-label="发送消息">发送 ↑</button></div>
       </form>
       <div class="bottom-note">切换会话不会停止任务 · 同项目会话共享工作目录</div>
     </section>
@@ -75,7 +84,8 @@
   <div id="inspector-scrim" class="scrim" hidden></div>
   <aside id="inspector" class="inspector" hidden>
     <header class="inspector-header"><strong>工作区面板</strong><button id="close-inspector" class="icon-button" aria-label="收起右侧面板">×</button></header>
-    <nav class="inspector-tabs tabs" role="tablist" aria-label="工作区面板标签"><button id="inspector-files-tab" role="tab" aria-controls="files-view" aria-selected="true" class="tab active" data-view="files">文件</button><button id="inspector-agents-tab" role="tab" aria-controls="agents-view" aria-selected="false" tabindex="-1" class="tab" data-view="agents">子代理 <span id="agent-count">0</span></button><button id="inspector-git-tab" role="tab" aria-controls="git-view" aria-selected="false" tabindex="-1" class="tab" data-view="git">Git diff</button><button id="inspector-btw-tab" role="tab" aria-controls="btw-view" aria-selected="false" tabindex="-1" class="tab" data-view="btw">BTW</button></nav>
+    <nav class="inspector-tabs tabs" role="tablist" aria-label="工作区面板标签"><button id="inspector-files-tab" role="tab" aria-controls="files-view" aria-selected="true" class="tab active" data-view="files">文件</button><button id="inspector-terminal-tab" role="tab" aria-controls="terminal-view" aria-selected="false" tabindex="-1" class="tab" data-view="terminal">终端</button><button id="inspector-agents-tab" role="tab" aria-controls="agents-view" aria-selected="false" tabindex="-1" class="tab" data-view="agents">子代理 <span id="agent-count">0</span></button><button id="inspector-git-tab" role="tab" aria-controls="git-view" aria-selected="false" tabindex="-1" class="tab" data-view="git">Git diff</button><button id="inspector-btw-tab" role="tab" aria-controls="btw-view" aria-selected="false" tabindex="-1" class="tab" data-view="btw">BTW</button></nav>
+    <section id="terminal-view" class="view terminal-view" role="tabpanel" aria-labelledby="inspector-terminal-tab" tabindex="0" hidden></section>
     <section id="btw-view" class="view btw-view" role="tabpanel" aria-labelledby="inspector-btw-tab" hidden></section>
     <section id="files-view" class="view files-view" role="tabpanel" aria-labelledby="inspector-files-tab"></section>
     <section id="agents-view" class="view secondary-view" role="tabpanel" aria-labelledby="inspector-agents-tab" tabindex="0" hidden><div class="panel-heading"><div><h2>子代理</h2><p>追踪这个会话派发的工作</p></div><button id="refresh-agents" class="secondary-button">刷新</button></div><div id="agents-list"></div><button id="more-agents" class="text-button" hidden>加载更多子代理</button></section>
@@ -86,15 +96,42 @@
   </dialog>
   <dialog id="model-dialog">
     <form id="model-form">
-      <div class="dialog-heading"><h2>模型与 Reasoning</h2><button id="close-model-dialog" type="button" class="icon-button" aria-label="关闭模型设置">×</button></div>
+      <div class="dialog-heading"><h2>会话设置</h2><button id="close-model-dialog" type="button" class="icon-button" aria-label="关闭会话设置">×</button></div>
       <p id="model-scope" class="muted">设置作用于当前会话的后续消息。</p>
       <label for="model-select">模型</label><select id="model-select" required></select>
       <p id="model-description" class="muted"></p>
       <label for="reasoning-select">Reasoning · 推理强度</label><select id="reasoning-select"></select>
       <p id="reasoning-description" class="muted"></p>
+      <label for="authority-select">Authority · 权限</label><select id="authority-select"><option value="default">默认</option><option value="read-only">只读</option><option value="workspace">工作区</option><option value="full">完全访问</option></select>
+      <p id="authority-description" class="muted"></p>
       <p id="model-error" class="error-text" role="alert"></p>
       <button id="save-model" class="primary-button" type="submit">保存到当前会话</button>
     </form>
+  </dialog>
+  <dialog id="quota-dialog" aria-labelledby="quota-title">
+    <div class="dialog-heading"><h2 id="quota-title">账户剩余额度</h2><button id="close-quota-dialog" type="button" class="icon-button" aria-label="关闭账户额度">×</button></div>
+    <p id="quota-plan" class="muted">Codex 账户额度</p>
+    <section class="quota-window"><div><h3>5 小时额度</h3><strong id="quota-five-hour-remaining">—</strong></div><progress id="quota-five-hour-progress" max="100" value="0" aria-label="5 小时剩余额度" hidden></progress><p id="quota-five-hour-reset" class="muted">等待额度数据</p></section>
+    <section class="quota-window"><div><h3>周额度</h3><strong id="quota-weekly-remaining">—</strong></div><progress id="quota-weekly-progress" max="100" value="0" aria-label="每周剩余额度" hidden></progress><p id="quota-weekly-reset" class="muted">等待额度数据</p></section>
+    <p id="quota-status" class="muted" role="status"></p><button id="refresh-quota" type="button" class="secondary-button">刷新额度</button>
+  </dialog>
+  <dialog id="usage-dialog" aria-labelledby="usage-title">
+    <div class="dialog-heading"><h2 id="usage-title">上下文与用量</h2><button id="close-usage-dialog" type="button" class="icon-button" aria-label="关闭用量详情">×</button></div>
+    <p id="usage-thread" class="muted"></p>
+    <p class="muted">上下文已用</p><div id="usage-context" class="usage-context">—</div>
+    <progress id="usage-progress" max="100" value="0" aria-label="上下文占用"></progress>
+    <p id="usage-freshness" class="muted"></p>
+    <h3>本会话累计 token</h3><dl class="usage-breakdown">
+      <div><dt>输入</dt><dd id="usage-input">—</dd></div>
+      <div><dt>其中缓存输入</dt><dd id="usage-cached">—</dd></div>
+      <div><dt>输出</dt><dd id="usage-output">—</dd></div>
+      <div><dt>其中推理输出</dt><dd id="usage-reasoning">—</dd></div>
+      <div><dt>合计</dt><dd id="usage-total">—</dd></div>
+    </dl>
+    <p class="muted">累计用量包含重复输入，压缩不会将它清零。缓存与推理项已包含在输入或输出中，不重复相加。</p>
+    <button id="usage-compact" type="button" class="secondary-button">压缩上下文</button>
+    <p id="usage-compact-note" class="muted">压缩会用摘要替代较早内容，部分细节可能不再保留。</p>
+    <p id="usage-error" class="error-text" role="alert"></p>
   </dialog>
   <dialog id="steer-dialog">
     <form id="steer-form">
